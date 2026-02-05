@@ -37,7 +37,7 @@
 
 use crate::poseidon::FieldHasher;
 use anyhow::{Error, Result};
-use halo2_proofs::arithmetic::FieldExt;
+use ff::{FromUniformBytes, PrimeField};
 use std::{
     borrow::ToOwned,
     collections::{BTreeMap, BTreeSet},
@@ -71,14 +71,14 @@ impl std::error::Error for MerkleError {}
 /// Each pair is used to identify whether an incremental merkle root
 /// construction is valid at each intermediate step.
 #[derive(Clone)]
-pub struct Path<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> {
+pub struct Path<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> {
     /// The path represented as a sequence of sibling pairs.
     pub path: [(F, F); N],
     /// The phantom hasher type used to reconstruct the merkle root.
     pub marker: PhantomData<H>,
 }
 
-impl<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> Path<F, H, N> {
+impl<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> Path<F, H, N> {
     /// Takes in an expected `root_hash` and leaf-level data (i.e. hashes of
     /// secrets) for a leaf and checks that the leaf belongs to a tree having
     /// the expected hash.
@@ -115,8 +115,8 @@ impl<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> Path<F, H, N> {
         }
 
         let mut prev = *leaf;
-        let mut index = F::zero();
-        let mut twopower = F::one();
+        let mut index = F::ZERO;
+        let mut twopower = F::ONE;
         // Check levels between leaf level and root
         for &(ref left_hash, ref right_hash) in &self.path {
             // Check if the previous hash is for a left node or right node
@@ -136,7 +136,7 @@ impl<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> Path<F, H, N> {
 /// The Sparse Merkle Tree stores a set of leaves represented in a map and
 /// a set of empty hashes that it uses to represent the sparse areas of the
 /// tree.
-pub struct SparseMerkleTree<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> {
+pub struct SparseMerkleTree<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize> {
     /// A map from leaf indices to leaf data stored as field elements.
     pub tree: BTreeMap<u64, F>,
     /// An array of default hashes hashed with themselves `N` times.
@@ -145,7 +145,7 @@ pub struct SparseMerkleTree<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> {
     marker: PhantomData<H>,
 }
 
-impl<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> SparseMerkleTree<F, H, N> {
+impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize> SparseMerkleTree<F, H, N> {
     /// Takes a batch of field elements, inserts
     /// these hashes into the tree, and updates the merkle root.
     pub fn insert_batch(&mut self, leaves: &BTreeMap<u32, F>, hasher: &H) -> Result<(), Error> {
@@ -231,7 +231,7 @@ impl<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> SparseMerkleTree<F, H, N
     /// a "proof" in the sense of "valid path in a Merkle tree", not a ZK
     /// argument.
     pub fn generate_membership_proof(&self, index: u64) -> Path<F, H, N> {
-        let mut path = [(F::zero(), F::zero()); N];
+        let mut path = [(F::ZERO, F::ZERO); N];
 
         let tree_index = convert_index_to_last_level(index, N);
 
@@ -268,13 +268,14 @@ impl<F: FieldExt, H: FieldHasher<F, 2>, const N: usize> SparseMerkleTree<F, H, N
 /// of the `default_leaf` hashed with itself and repeated `N` times
 /// with the intermediate results. These are used to initialize the
 /// sparse portion of the Sparse Merkle Tree.
-pub fn gen_empty_hashes<F: FieldExt, H: FieldHasher<F, 2>, const N: usize>(
+pub fn gen_empty_hashes<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>(
     hasher: &H,
     default_leaf: &[u8; 64],
 ) -> Result<[F; N], Error> {
-    let mut empty_hashes = [F::zero(); N];
+    let mut empty_hashes = [F::ZERO; N];
 
-    let mut empty_hash = F::from_bytes_wide(default_leaf);
+    // Convert default_leaf bytes to field element using from_uniform_bytes
+    let mut empty_hash = F::from_uniform_bytes(default_leaf);
     for item in empty_hashes.iter_mut().take(N) {
         *item = empty_hash;
         empty_hash = hasher.hash([empty_hash, empty_hash])?;
@@ -349,14 +350,13 @@ fn parent(index: u64) -> Option<u64> {
 mod test {
     use super::{gen_empty_hashes, SparseMerkleTree};
     use crate::poseidon::{FieldHasher, Poseidon};
-    use halo2_proofs::arithmetic::Field;
-    use halo2_proofs::arithmetic::FieldExt;
-    use halo2_proofs::pasta::Fp;
+    use ff::{Field, FromUniformBytes, PrimeField};
+    use pasta_curves::Fp;
     use rand::rngs::OsRng;
     use std::collections::BTreeMap;
 
     //helper to change leaves array to BTreeMap and then create SMT
-    fn create_merkle_tree<F: FieldExt, H: FieldHasher<F, 2>, const N: usize>(
+    fn create_merkle_tree<F: PrimeField + FromUniformBytes<64> + Ord, H: FieldHasher<F, 2>, const N: usize>(
         hasher: H,
         leaves: &[F],
         default_leaf: &[u8; 64],

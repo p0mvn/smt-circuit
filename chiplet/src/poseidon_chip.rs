@@ -1,10 +1,10 @@
 // Copyright (c) zkMove Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use ff::PrimeField;
 use halo2_gadgets::poseidon::primitives::{ConstantLength, Spec};
 use halo2_gadgets::poseidon::{Hash, Pow5Chip, Pow5Config};
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::{AssignedCell, Layouter},
     plonk::{Advice, Column, ConstraintSystem, Error},
 };
@@ -13,14 +13,14 @@ use std::marker::PhantomData;
 /// A wrapper for halo2 poseidon Pow5Chip.
 
 #[derive(Clone)]
-pub struct PoseidonConfig<F: FieldExt, const WIDTH: usize, const RATE: usize> {
+pub struct PoseidonConfig<F: PrimeField, const WIDTH: usize, const RATE: usize> {
     inputs: [Column<Advice>; WIDTH],
     pow5_config: Pow5Config<F, WIDTH, RATE>,
 }
 
 #[derive(Clone)]
 pub struct PoseidonChip<
-    F: FieldExt,
+    F: PrimeField,
     S: Spec<F, WIDTH, RATE>,
     const WIDTH: usize,
     const RATE: usize,
@@ -31,7 +31,7 @@ pub struct PoseidonChip<
 }
 
 impl<
-        F: FieldExt,
+        F: PrimeField,
         S: Spec<F, WIDTH, RATE>,
         const WIDTH: usize,
         const RATE: usize,
@@ -102,26 +102,26 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::{PoseidonChip, PoseidonConfig};
+    use ff::PrimeField;
     use halo2_gadgets::poseidon::primitives::Spec;
     use halo2_proofs::dev::MockProver;
-    use halo2_proofs::pasta::Fp;
     use halo2_proofs::{
-        arithmetic::FieldExt,
         circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     };
+    use pasta_curves::Fp;
     use smt::poseidon::{FieldHasher, Poseidon, SmtP128Pow5T3};
     use std::marker::PhantomData;
 
     #[derive(Clone)]
-    struct TestConfig<F: FieldExt, const WIDTH: usize, const RATE: usize, const L: usize> {
+    struct TestConfig<F: PrimeField, const WIDTH: usize, const RATE: usize, const L: usize> {
         poseidon_config: PoseidonConfig<F, WIDTH, RATE>,
         inputs: [Column<Advice>; L],
         output: Column<Advice>,
     }
 
     struct TestCircuit<
-        F: FieldExt,
+        F: PrimeField,
         S: Spec<F, WIDTH, RATE>,
         const WIDTH: usize,
         const RATE: usize,
@@ -133,7 +133,7 @@ mod tests {
     }
 
     impl<
-            F: FieldExt,
+            F: PrimeField,
             S: Spec<F, WIDTH, RATE>,
             const WIDTH: usize,
             const RATE: usize,

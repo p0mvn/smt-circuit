@@ -16,9 +16,9 @@ use crate::utilities::{
     AssertEqualChip, AssertEqualConfig, ConditionalSelectChip, ConditionalSelectConfig,
     IsEqualChip, IsEqualConfig, NUM_OF_UTILITY_ADVICE_COLUMNS,
 };
+use ff::PrimeField;
 use halo2_gadgets::poseidon::primitives::Spec;
 use halo2_proofs::{
-    arithmetic::FieldExt,
     circuit::{AssignedCell, Layouter, Value},
     plonk::{Advice, Column, ConstraintSystem, Error, Selector},
 };
@@ -28,7 +28,7 @@ use std::marker::PhantomData;
 
 #[derive(Clone)]
 pub struct PathConfig<
-    F: FieldExt,
+    F: PrimeField,
     S: Spec<F, WIDTH, RATE>,
     const WIDTH: usize,
     const RATE: usize,
@@ -44,7 +44,7 @@ pub struct PathConfig<
 }
 
 pub struct PathChip<
-    F: FieldExt,
+    F: PrimeField,
     S: Spec<F, WIDTH, RATE>,
     H: FieldHasher<F, 2>,
     const WIDTH: usize,
@@ -61,7 +61,7 @@ pub struct PathChip<
 }
 
 impl<
-        F: FieldExt,
+        F: PrimeField,
         S: Spec<F, WIDTH, RATE>,
         H: FieldHasher<F, 2>,
         const WIDTH: usize,
@@ -200,16 +200,17 @@ mod test {
     use super::{PathChip, PathConfig};
     use crate::measure;
     use crate::utilities::{AssertEqualChip, AssertEqualConfig};
+    use ff::{Field, FromUniformBytes, PrimeField};
     use halo2_gadgets::poseidon::primitives::Spec;
     use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, SingleVerifier};
     use halo2_proofs::poly::commitment::Params;
     use halo2_proofs::transcript::{Blake2bRead, Blake2bWrite, Challenge255};
     use halo2_proofs::{
-        arithmetic::{Field, FieldExt},
         circuit::{Layouter, SimpleFloorPlanner, Value},
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     };
-    use halo2_proofs::{dev::MockProver, pasta::EqAffine, pasta::Fp};
+    use halo2_proofs::dev::MockProver;
+    use pasta_curves::{EqAffine, Fp};
     use rand::rngs::OsRng;
     use smt::poseidon::{FieldHasher, Poseidon, SmtP128Pow5T3};
     use smt::smt::SparseMerkleTree;
@@ -219,7 +220,7 @@ mod test {
 
     #[derive(Clone)]
     struct TestConfig<
-        F: FieldExt,
+        F: PrimeField,
         S: Spec<F, WIDTH, RATE>,
         H: FieldHasher<F, 2>,
         const WIDTH: usize,
@@ -233,7 +234,7 @@ mod test {
     }
 
     struct TestCircuit<
-        F: FieldExt,
+        F: PrimeField,
         S: Spec<F, WIDTH, RATE>,
         H: FieldHasher<F, 2>,
         const WIDTH: usize,
@@ -247,7 +248,7 @@ mod test {
     }
 
     impl<
-            F: FieldExt,
+            F: PrimeField + FromUniformBytes<64> + Ord,
             S: Spec<F, WIDTH, RATE> + Clone,
             H: FieldHasher<F, 2> + Clone,
             const WIDTH: usize,
@@ -260,7 +261,7 @@ mod test {
 
         fn without_witnesses(&self) -> Self {
             Self {
-                leaves: [F::zero(), F::zero(), F::zero()],
+                leaves: [F::ZERO, F::ZERO, F::ZERO],
                 empty_leaf: [0u8; 64],
                 hasher: H::hasher(),
                 _spec: PhantomData,
@@ -318,7 +319,7 @@ mod test {
                         || "one",
                         config.advices[2],
                         0,
-                        || Value::known(F::one()),
+                        || Value::known(F::ONE),
                     )?;
                     Ok((root_cell, leaf_cell, one))
                 },
