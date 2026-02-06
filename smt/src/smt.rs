@@ -274,12 +274,12 @@ pub struct SparseMerkleTree<F: PrimeField + FromUniformBytes<64>, H: FieldHasher
 impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize> SparseMerkleTree<F, H, N> {
     /// Takes a batch of field elements, inserts
     /// these hashes into the tree, and updates the merkle root.
-    pub fn insert_batch(&mut self, leaves: &BTreeMap<u32, F>, hasher: &H) -> Result<(), Error> {
+    pub fn insert_batch(&mut self, leaves: &BTreeMap<u64, F>, hasher: &H) -> Result<(), Error> {
         let last_level_index: u64 = (1u64 << N) - 1;
 
         let mut level_idxs: BTreeSet<u64> = BTreeSet::new();
         for (i, leaf) in leaves {
-            let true_index = last_level_index + (*i as u64);
+            let true_index = last_level_index + *i;
             self.tree.insert(true_index, *leaf);
             level_idxs.insert(parent(true_index).unwrap());
         }
@@ -309,7 +309,7 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
     /// Creates a new Sparse Merkle Tree from a map of indices to field
     /// elements.
     pub fn new(
-        leaves: &BTreeMap<u32, F>,
+        leaves: &BTreeMap<u64, F>,
         hasher: &H,
         empty_leaf: &[u8; 64],
     ) -> Result<Self, Error> {
@@ -335,10 +335,10 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
 
     /// Creates a new Sparse Merkle Tree from an array of field elements.
     pub fn new_sequential(leaves: &[F], hasher: &H, empty_leaf: &[u8; 64]) -> Result<Self, Error> {
-        let pairs: BTreeMap<u32, F> = leaves
+        let pairs: BTreeMap<u64, F> = leaves
             .iter()
             .enumerate()
-            .map(|(i, l)| (i as u32, *l))
+            .map(|(i, l)| (i as u64, *l))
             .collect();
         let smt = Self::new(&pairs, hasher, empty_leaf)?;
 
@@ -533,10 +533,10 @@ mod test {
         leaves: &[F],
         default_leaf: &[u8; 64],
     ) -> SparseMerkleTree<F, H, N> {
-        let pairs: BTreeMap<u32, F> = leaves
+        let pairs: BTreeMap<u64, F> = leaves
             .iter()
             .enumerate()
-            .map(|(i, l)| (i as u32, *l))
+            .map(|(i, l)| (i as u64, *l))
             .collect();
 
         SparseMerkleTree::<F, H, N>::new(&pairs, &hasher, default_leaf).unwrap()
