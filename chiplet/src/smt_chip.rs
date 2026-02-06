@@ -342,12 +342,12 @@ mod test {
     #[test]
     fn should_verify_path() {
         // Circuit is very small, we pick a small value here
-        let k = 13;
+        let k = 17;
 
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
-        const HEIGHT: usize = 3;
+        const HEIGHT: usize = 20;
 
         let circuit = TestCircuit::<Fp, SmtP128Pow5T3<Fp, 0>, Poseidon<Fp, 2>, 3, 2, HEIGHT> {
             leaves,
@@ -361,9 +361,19 @@ mod test {
 
         let now = Instant::now();
         let params: Params<EqAffine> = Params::new(k);
+        println!("Params::new(k={}) time: {:?}", k, now.elapsed());
+
+        let mut params_buf = vec![];
+        params.write(&mut params_buf).expect("params serialization should not fail");
+        println!("Params size: {:.2} MB", params_buf.len() as f64 / (1024.0 * 1024.0));
+
+        let now = Instant::now();
         let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
+        println!("keygen_vk time: {:?}", now.elapsed());
+
+        let now = Instant::now();
         let pk = keygen_pk(&params, vk, &circuit).expect("keygen_pk should not fail");
-        println!("keygen time is {:?}", now.elapsed());
+        println!("keygen_pk time: {:?}", now.elapsed());
 
         let now = Instant::now();
         let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
