@@ -4,31 +4,31 @@ overview: Add a `SparsePath` native data structure and `SparsePathChip` circuit 
 todos:
   - id: native-types
     content: Add SparsePathEntry and SparsePath types to smt/src/smt.rs
-    status: pending
+    status: completed
   - id: native-generate
     content: Add generate_sparse_membership_proof() to SparseMerkleTree
-    status: pending
+    status: completed
   - id: native-roots
     content: Implement calculate_compact_root(), calculate_full_root(), and to_padded_arrays() on SparsePath
-    status: pending
+    status: completed
   - id: native-tests
     content: Add native tests for sparse proof generation, compact root, and full root consistency
-    status: pending
+    status: completed
   - id: circuit-config
     content: Add SparsePathConfig and SparsePathChip structs with configure() in smt_chip.rs
-    status: pending
+    status: completed
   - id: circuit-from-native
     content: Implement SparsePathChip::from_native() with padding for inactive slots
-    status: pending
+    status: completed
   - id: circuit-calculate-root
     content: Implement calculate_root() with swap + hash + conditional_select loop
-    status: pending
+    status: completed
   - id: circuit-check-membership
     content: Implement check_membership() using IsEqual against compact root
-    status: pending
+    status: completed
   - id: circuit-tests
     content: "Add circuit tests: MockProver, full prove/verify cycle, sparse vs dense consistency"
-    status: pending
+    status: completed
 isProject: false
 ---
 
