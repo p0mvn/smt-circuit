@@ -10,6 +10,7 @@ use halo2_proofs::{
 use std::marker::PhantomData;
 
 pub const NUM_OF_UTILITY_ADVICE_COLUMNS: usize = 4;
+pub const NUM_OF_SWAP_ADVICE_COLUMNS: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct ConditionalSelectConfig<F: PrimeField> {
@@ -310,5 +311,134 @@ impl<F: PrimeField> AssertEqualChip<F> {
         )?;
 
         Ok(())
+    }
+}
+
+/// A single-row conditional swap gate.
+///
+/// Given inputs `(a, b, bit)`, outputs `(out_a, out_b)` where:
+/// - `bit = 0`: `(out_a, out_b) = (a, b)` (no swap)
+/// - `bit = 1`: `(out_a, out_b) = (b, a)` (swapped)
+///
+/// Uses 5 advice columns in a single row with constraints:
+/// - `bit * (1 - bit) = 0`              (boolean)
+/// - `out_a = (1 - bit) * a + bit * b`  (first output)
+/// - `out_b = bit * a + (1 - bit) * b`  (second output)
+#[derive(Clone, Debug)]
+pub struct ConditionalSwapConfig<F: PrimeField> {
+    advices: [Column<Advice>; NUM_OF_SWAP_ADVICE_COLUMNS],
+    s_swap: Selector,
+    _marker: PhantomData<F>,
+}
+
+pub struct ConditionalSwapChip<F: PrimeField> {
+    config: ConditionalSwapConfig<F>,
+    _marker: PhantomData<F>,
+}
+
+impl<F: PrimeField> Chip<F> for ConditionalSwapChip<F> {
+    type Config = ConditionalSwapConfig<F>;
+    type Loaded = ();
+
+    fn config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn loaded(&self) -> &Self::Loaded {
+        &()
+    }
+}
+
+impl<F: PrimeField> ConditionalSwapChip<F> {
+    pub fn construct(
+        config: <Self as Chip<F>>::Config,
+        _loaded: <Self as Chip<F>>::Loaded,
+    ) -> Self {
+        Self {
+            config,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn configure(
+        meta: &mut ConstraintSystem<F>,
+        advices: [Column<Advice>; NUM_OF_SWAP_ADVICE_COLUMNS],
+    ) -> <Self as Chip<F>>::Config {
+        for column in &advices {
+            meta.enable_equality(*column);
+        }
+        let s_swap = meta.selector();
+
+        meta.create_gate("conditional_swap", |meta| {
+            let a = meta.query_advice(advices[0], Rotation::cur());
+            let b = meta.query_advice(advices[1], Rotation::cur());
+            let bit = meta.query_advice(advices[2], Rotation::cur());
+            let out_a = meta.query_advice(advices[3], Rotation::cur());
+            let out_b = meta.query_advice(advices[4], Rotation::cur());
+            let s_swap = meta.query_selector(s_swap);
+            let one = Expression::Constant(F::ONE);
+
+            vec![
+                // bit is boolean
+                s_swap.clone() * (bit.clone() * (one.clone() - bit.clone())),
+                // out_a = (1 - bit) * a + bit * b
+                s_swap.clone()
+                    * (out_a
+                        - (one.clone() - bit.clone()) * a.clone()
+                        - bit.clone() * b.clone()),
+                // out_b = bit * a + (1 - bit) * b
+                s_swap * (out_b - bit.clone() * a - (one - bit) * b),
+            ]
+        });
+
+        ConditionalSwapConfig {
+            advices,
+            s_swap,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn swap(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        a: AssignedCell<F, F>,
+        b: AssignedCell<F, F>,
+        bit: AssignedCell<F, F>,
+    ) -> Result<(AssignedCell<F, F>, AssignedCell<F, F>), Error> {
+        let config = self.config();
+
+        layouter.assign_region(
+            || "conditional_swap",
+            |mut region: Region<'_, F>| {
+                config.s_swap.enable(&mut region, 0)?;
+
+                a.copy_advice(|| "copy a", &mut region, config.advices[0], 0)?;
+                b.copy_advice(|| "copy b", &mut region, config.advices[1], 0)?;
+                bit.copy_advice(|| "copy bit", &mut region, config.advices[2], 0)?;
+
+                let out_a_val = bit.value().copied().and_then(|bit_val| {
+                    if bit_val == F::ZERO {
+                        a.value().copied()
+                    } else {
+                        b.value().copied()
+                    }
+                });
+
+                let out_b_val = bit.value().copied().and_then(|bit_val| {
+                    if bit_val == F::ZERO {
+                        b.value().copied()
+                    } else {
+                        a.value().copied()
+                    }
+                });
+
+                let out_a =
+                    region.assign_advice(|| "out_a", config.advices[3], 0, || out_a_val)?;
+                let out_b =
+                    region.assign_advice(|| "out_b", config.advices[4], 0, || out_b_val)?;
+
+                Ok((out_a, out_b))
+            },
+        )
     }
 }

@@ -74,6 +74,9 @@ impl std::error::Error for MerkleError {}
 pub struct Path<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> {
     /// The path represented as a sequence of sibling pairs.
     pub path: [(F, F); N],
+    /// Direction bits indicating which side of the tree the path descends on each level.
+    /// `false` (0) means the node is a left child, `true` (1) means it is a right child.
+    pub direction_bits: [bool; N],
     /// The phantom hasher type used to reconstruct the merkle root.
     pub marker: PhantomData<H>,
 }
@@ -232,6 +235,7 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
     /// argument.
     pub fn generate_membership_proof(&self, index: u64) -> Path<F, H, N> {
         let mut path = [(F::ZERO, F::ZERO); N];
+        let mut direction_bits = [false; N];
 
         let tree_index = convert_index_to_last_level(index, N);
 
@@ -246,6 +250,9 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
             let current = self.tree.get(&current_node).cloned().unwrap_or(*empty_hash);
             let sibling = self.tree.get(&sibling_node).cloned().unwrap_or(*empty_hash);
 
+            // direction_bit = true means the node is a right child
+            direction_bits[level] = !is_left_child(current_node);
+
             if is_left_child(current_node) {
                 path[level] = (current, sibling);
             } else {
@@ -257,6 +264,7 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
 
         Path {
             path,
+            direction_bits,
             marker: PhantomData,
         }
     }
