@@ -13,8 +13,8 @@
 
 use crate::poseidon_chip::{PoseidonChip, PoseidonConfig};
 use crate::utilities::{
-    AssertEqualChip, AssertEqualConfig, ConditionalSelectChip, ConditionalSelectConfig,
-    IsEqualChip, IsEqualConfig, NUM_OF_UTILITY_ADVICE_COLUMNS,
+    ConditionalSwapChip, ConditionalSwapConfig, IsEqualChip, IsEqualConfig,
+    NUM_OF_SWAP_ADVICE_COLUMNS, NUM_OF_UTILITY_ADVICE_COLUMNS,
 };
 use ff::PrimeField;
 use halo2_gadgets::poseidon::primitives::Spec;
@@ -38,8 +38,7 @@ pub struct PathConfig<
     advices: [Column<Advice>; N],
     poseidon_config: PoseidonConfig<F, WIDTH, RATE>,
     is_eq_config: IsEqualConfig<F>,
-    conditional_select_config: ConditionalSelectConfig<F>,
-    assert_equal_config: AssertEqualConfig<F>,
+    swap_config: ConditionalSwapConfig<F>,
     _spec: PhantomData<S>,
 }
 
@@ -51,11 +50,11 @@ pub struct PathChip<
     const RATE: usize,
     const N: usize,
 > {
-    path: [(AssignedCell<F, F>, AssignedCell<F, F>); N],
+    siblings: [AssignedCell<F, F>; N],
+    direction_bits: [AssignedCell<F, F>; N],
     poseidon_chip: PoseidonChip<F, S, WIDTH, RATE, 2>,
     is_eq_chip: IsEqualChip<F>,
-    conditional_select_chip: ConditionalSelectChip<F>,
-    assert_equal_chip: AssertEqualChip<F>,
+    swap_chip: ConditionalSwapChip<F>,
     _spec: PhantomData<S>,
     _hasher: PhantomData<H>,
 }
@@ -72,25 +71,23 @@ impl<
     pub fn configure(meta: &mut ConstraintSystem<F>) -> PathConfig<F, S, WIDTH, RATE, N> {
         let s_path = meta.selector();
         let advices = [(); N].map(|_| meta.advice_column());
-        let utility_advices = [(); NUM_OF_UTILITY_ADVICE_COLUMNS].map(|_| meta.advice_column());
+        let swap_advices: [Column<Advice>; NUM_OF_SWAP_ADVICE_COLUMNS] =
+            [(); NUM_OF_SWAP_ADVICE_COLUMNS].map(|_| meta.advice_column());
 
         advices
             .iter()
             .for_each(|column| meta.enable_equality(*column));
-        utility_advices
-            .iter()
-            .for_each(|column| meta.enable_equality(*column));
+
+        // IsEqual reuses the first 4 of the 5 swap columns (gates are selector-gated)
+        let is_eq_advices: [Column<Advice>; NUM_OF_UTILITY_ADVICE_COLUMNS] =
+            swap_advices[..NUM_OF_UTILITY_ADVICE_COLUMNS].try_into().unwrap();
 
         PathConfig {
             s_path,
             advices,
             poseidon_config: PoseidonChip::<F, S, WIDTH, RATE, 2>::configure(meta),
-            is_eq_config: IsEqualChip::configure(meta, utility_advices),
-            conditional_select_config: ConditionalSelectChip::configure(meta, utility_advices),
-            assert_equal_config: AssertEqualChip::configure(
-                meta,
-                [utility_advices[0], utility_advices[1]],
-            ),
+            is_eq_config: IsEqualChip::configure(meta, is_eq_advices),
+            swap_config: ConditionalSwapChip::configure(meta, swap_advices),
             _spec: PhantomData,
         }
     }
@@ -100,49 +97,57 @@ impl<
         layouter: &mut impl Layouter<F>,
         native: Path<F, H, N>,
     ) -> Result<Self, Error> {
-        let path = layouter.assign_region(
+        let (siblings, direction_bits) = layouter.assign_region(
             || "path",
             |mut region| {
                 config.s_path.enable(&mut region, 0)?;
-                let left = (0..N)
+
+                let siblings = (0..N)
                     .map(|i| {
+                        // Extract the sibling node based on direction bit
+                        let sibling = if native.direction_bits[i] {
+                            native.path[i].0 // we're right child, sibling is the left node
+                        } else {
+                            native.path[i].1 // we're left child, sibling is the right node
+                        };
                         region.assign_advice(
-                            || format!("path[{}][{}]", i, 0),
+                            || format!("sibling[{}]", i),
                             config.advices[i],
                             0,
-                            || Value::known(native.path[i].0),
+                            || Value::known(sibling),
                         )
                     })
-                    .collect::<Result<Vec<AssignedCell<F, F>>, Error>>();
+                    .collect::<Result<Vec<AssignedCell<F, F>>, Error>>()?;
 
-                let right = (0..N)
+                let direction_bits = (0..N)
                     .map(|i| {
+                        let bit = if native.direction_bits[i] {
+                            F::ONE
+                        } else {
+                            F::ZERO
+                        };
                         region.assign_advice(
-                            || format!("path[{}][{}]", i, 1),
+                            || format!("direction_bit[{}]", i),
                             config.advices[i],
                             1,
-                            || Value::known(native.path[i].1),
+                            || Value::known(bit),
                         )
                     })
-                    .collect::<Result<Vec<AssignedCell<F, F>>, Error>>();
+                    .collect::<Result<Vec<AssignedCell<F, F>>, Error>>()?;
 
-                let result = left?
-                    .into_iter()
-                    .zip(right?.into_iter())
-                    .collect::<Vec<(AssignedCell<F, F>, AssignedCell<F, F>)>>();
-                Ok(result.try_into().unwrap())
+                Ok((
+                    siblings.try_into().unwrap(),
+                    direction_bits.try_into().unwrap(),
+                ))
             },
         )?;
 
         Ok(PathChip {
-            path,
+            siblings,
+            direction_bits,
             poseidon_chip: PoseidonChip::<F, S, WIDTH, RATE, 2>::construct(config.poseidon_config),
             is_eq_chip: IsEqualChip::construct(config.is_eq_config, ()),
-            conditional_select_chip: ConditionalSelectChip::construct(
-                config.conditional_select_config,
-                (),
-            ),
-            assert_equal_chip: AssertEqualChip::construct(config.assert_equal_config, ()),
+            swap_chip: ConditionalSwapChip::construct(config.swap_config, ()),
             _spec: PhantomData,
             _hasher: PhantomData,
         })
@@ -153,29 +158,17 @@ impl<
         layouter: &mut impl Layouter<F>,
         leaf: AssignedCell<F, F>,
     ) -> Result<AssignedCell<F, F>, Error> {
-        // Check levels between leaf level and root
         let mut previous_hash = leaf;
 
-        for (left_hash, right_hash) in self.path.iter() {
-            // Check if previous_hash matches the correct current hash
-            let previous_is_left = self.is_eq_chip.is_eq_with_output(
+        for i in 0..N {
+            // Swap (previous_hash, sibling) based on direction bit to get (left, right)
+            let (left, right) = self.swap_chip.swap(
                 layouter,
-                previous_hash.clone(),
-                left_hash.clone(),
+                previous_hash,
+                self.siblings[i].clone(),
+                self.direction_bits[i].clone(),
             )?;
-            let left_or_right = self.conditional_select_chip.conditional_select(
-                layouter,
-                left_hash.clone(),
-                right_hash.clone(),
-                previous_is_left,
-            )?;
-            self.assert_equal_chip
-                .assert_equal(layouter, previous_hash, left_or_right)?;
-
-            // Update previous_hash
-            previous_hash = self
-                .poseidon_chip
-                .hash(layouter, &[left_hash.clone(), right_hash.clone()])?;
+            previous_hash = self.poseidon_chip.hash(layouter, &[left, right])?;
         }
 
         Ok(previous_hash)
