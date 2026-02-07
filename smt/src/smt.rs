@@ -38,6 +38,7 @@
 use crate::poseidon::FieldHasher;
 use anyhow::{Error, Result};
 use ff::{FromUniformBytes, PrimeField};
+use std::time::Instant;
 use std::{
     borrow::ToOwned,
     collections::{BTreeMap, BTreeSet},
@@ -285,6 +286,13 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
         }
 
         for level in 0..N {
+            log::debug!(
+                "[SMT] Processing level {}/{} ({} nodes to hash)",
+                level + 1,
+                N,
+                level_idxs.len()
+            );
+            let level_start = Instant::now();
             let mut new_idxs: BTreeSet<u64> = BTreeSet::new();
             let empty_hash = self.empty_hashes[level];
             for i in level_idxs {
@@ -300,6 +308,12 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
                 };
                 new_idxs.insert(parent);
             }
+            log::debug!(
+                "[SMT] Level {}/{} completed in {:?}",
+                level + 1,
+                N,
+                level_start.elapsed()
+            );
             level_idxs = new_idxs;
         }
 
@@ -313,6 +327,13 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
         hasher: &H,
         empty_leaf: &[u8; 64],
     ) -> Result<Self, Error> {
+        log::info!(
+            "[SMT] Building tree: height={}, leaves={}",
+            N,
+            leaves.len()
+        );
+        let start = Instant::now();
+
         // Ensure the tree can hold this many leaves
         let last_level_size = leaves.len().next_power_of_two();
         let tree_size = 2 * last_level_size - 1;
@@ -330,11 +351,24 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
         };
         smt.insert_batch(leaves, hasher)?;
 
+        log::info!(
+            "[SMT] Tree built in {:?} (height={}, leaves={}, tree_nodes={})",
+            start.elapsed(),
+            N,
+            leaves.len(),
+            smt.tree.len()
+        );
+
         Ok(smt)
     }
 
     /// Creates a new Sparse Merkle Tree from an array of field elements.
     pub fn new_sequential(leaves: &[F], hasher: &H, empty_leaf: &[u8; 64]) -> Result<Self, Error> {
+        log::info!(
+            "[SMT] Building sequential tree: height={}, leaves={}",
+            N,
+            leaves.len()
+        );
         let pairs: BTreeMap<u32, F> = leaves
             .iter()
             .enumerate()
