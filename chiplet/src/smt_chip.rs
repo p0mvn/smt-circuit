@@ -11,13 +11,12 @@
 //! For more info on the Sparse Merkle Tree data structure, see the
 //! documentation for the native implementation.
 
-use crate::poseidon_chip::{PoseidonChip, PoseidonConfig};
+use crate::poseidon2_chip::{Poseidon2Chip, Poseidon2Config};
 use crate::utilities::{
     ConditionalSelectChip, ConditionalSelectConfig, ConditionalSwapChip, ConditionalSwapConfig,
     IsEqualChip, IsEqualConfig, NUM_OF_SWAP_ADVICE_COLUMNS, NUM_OF_UTILITY_ADVICE_COLUMNS,
 };
 use ff::PrimeField;
-use halo2_gadgets::poseidon::primitives::Spec;
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Value},
     plonk::{Advice, Column, ConstraintSystem, Error, Selector},
@@ -27,48 +26,25 @@ use smt::smt::{Path, SparsePath};
 use std::marker::PhantomData;
 
 #[derive(Clone)]
-pub struct PathConfig<
-    F: PrimeField,
-    S: Spec<F, WIDTH, RATE>,
-    const WIDTH: usize,
-    const RATE: usize,
-    const N: usize,
-> {
+pub struct PathConfig<F: PrimeField, const N: usize> {
     s_path: Selector,
     advices: [Column<Advice>; N],
-    poseidon_config: PoseidonConfig<F, WIDTH, RATE>,
+    poseidon_config: Poseidon2Config<F>,
     is_eq_config: IsEqualConfig<F>,
     swap_config: ConditionalSwapConfig<F>,
-    _spec: PhantomData<S>,
 }
 
-pub struct PathChip<
-    F: PrimeField,
-    S: Spec<F, WIDTH, RATE>,
-    H: FieldHasher<F, 2>,
-    const WIDTH: usize,
-    const RATE: usize,
-    const N: usize,
-> {
+pub struct PathChip<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> {
     siblings: [AssignedCell<F, F>; N],
     direction_bits: [AssignedCell<F, F>; N],
-    poseidon_chip: PoseidonChip<F, S, WIDTH, RATE, 2>,
+    poseidon_chip: Poseidon2Chip<F, 2>,
     is_eq_chip: IsEqualChip<F>,
     swap_chip: ConditionalSwapChip<F>,
-    _spec: PhantomData<S>,
     _hasher: PhantomData<H>,
 }
 
-impl<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const N: usize,
-    > PathChip<F, S, H, WIDTH, RATE, N>
-{
-    pub fn configure(meta: &mut ConstraintSystem<F>) -> PathConfig<F, S, WIDTH, RATE, N> {
+impl<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> PathChip<F, H, N> {
+    pub fn configure(meta: &mut ConstraintSystem<F>) -> PathConfig<F, N> {
         let s_path = meta.selector();
         let advices = [(); N].map(|_| meta.advice_column());
         let swap_advices: [Column<Advice>; NUM_OF_SWAP_ADVICE_COLUMNS] =
@@ -85,15 +61,14 @@ impl<
         PathConfig {
             s_path,
             advices,
-            poseidon_config: PoseidonChip::<F, S, WIDTH, RATE, 2>::configure(meta),
+            poseidon_config: Poseidon2Chip::<F, 2>::configure(meta),
             is_eq_config: IsEqualChip::configure(meta, is_eq_advices),
             swap_config: ConditionalSwapChip::configure(meta, swap_advices),
-            _spec: PhantomData,
         }
     }
 
     pub fn from_native(
-        config: PathConfig<F, S, WIDTH, RATE, N>,
+        config: PathConfig<F, N>,
         layouter: &mut impl Layouter<F>,
         native: Path<F, H, N>,
     ) -> Result<Self, Error> {
@@ -145,10 +120,9 @@ impl<
         Ok(PathChip {
             siblings,
             direction_bits,
-            poseidon_chip: PoseidonChip::<F, S, WIDTH, RATE, 2>::construct(config.poseidon_config),
+            poseidon_chip: Poseidon2Chip::<F, 2>::construct(config.poseidon_config),
             is_eq_chip: IsEqualChip::construct(config.is_eq_config, ()),
             swap_chip: ConditionalSwapChip::construct(config.swap_config, ()),
-            _spec: PhantomData,
             _hasher: PhantomData,
         })
     }
@@ -190,53 +164,30 @@ impl<
 // ========== Sparse Path Chip ==========
 
 #[derive(Clone)]
-pub struct SparsePathConfig<
-    F: PrimeField,
-    S: Spec<F, WIDTH, RATE>,
-    const WIDTH: usize,
-    const RATE: usize,
-    const MAX_K: usize,
-> {
+pub struct SparsePathConfig<F: PrimeField, const MAX_K: usize> {
     s_path: Selector,
     advices: [Column<Advice>; MAX_K],
-    poseidon_config: PoseidonConfig<F, WIDTH, RATE>,
+    poseidon_config: Poseidon2Config<F>,
     swap_config: ConditionalSwapConfig<F>,
     cond_select_config: ConditionalSelectConfig<F>,
     is_eq_config: IsEqualConfig<F>,
-    _spec: PhantomData<S>,
 }
 
-pub struct SparsePathChip<
-    F: PrimeField,
-    S: Spec<F, WIDTH, RATE>,
-    H: FieldHasher<F, 2>,
-    const WIDTH: usize,
-    const RATE: usize,
-    const MAX_K: usize,
-> {
+pub struct SparsePathChip<F: PrimeField, H: FieldHasher<F, 2>, const MAX_K: usize> {
     siblings: [AssignedCell<F, F>; MAX_K],
     direction_bits: [AssignedCell<F, F>; MAX_K],
     is_active: [AssignedCell<F, F>; MAX_K],
-    poseidon_chip: PoseidonChip<F, S, WIDTH, RATE, 2>,
+    poseidon_chip: Poseidon2Chip<F, 2>,
     swap_chip: ConditionalSwapChip<F>,
     cond_select_chip: ConditionalSelectChip<F>,
     is_eq_chip: IsEqualChip<F>,
-    _spec: PhantomData<S>,
     _hasher: PhantomData<H>,
 }
 
-impl<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const MAX_K: usize,
-    > SparsePathChip<F, S, H, WIDTH, RATE, MAX_K>
+impl<F: PrimeField, H: FieldHasher<F, 2>, const MAX_K: usize>
+    SparsePathChip<F, H, MAX_K>
 {
-    pub fn configure(
-        meta: &mut ConstraintSystem<F>,
-    ) -> SparsePathConfig<F, S, WIDTH, RATE, MAX_K> {
+    pub fn configure(meta: &mut ConstraintSystem<F>) -> SparsePathConfig<F, MAX_K> {
         let s_path = meta.selector();
         let advices = [(); MAX_K].map(|_| meta.advice_column());
         let swap_advices: [Column<Advice>; NUM_OF_SWAP_ADVICE_COLUMNS] =
@@ -256,16 +207,15 @@ impl<
         SparsePathConfig {
             s_path,
             advices,
-            poseidon_config: PoseidonChip::<F, S, WIDTH, RATE, 2>::configure(meta),
+            poseidon_config: Poseidon2Chip::<F, 2>::configure(meta),
             swap_config: ConditionalSwapChip::configure(meta, swap_advices),
             cond_select_config: ConditionalSelectChip::configure(meta, utility_advices),
             is_eq_config: IsEqualChip::configure(meta, utility_advices),
-            _spec: PhantomData,
         }
     }
 
     pub fn from_native(
-        config: SparsePathConfig<F, S, WIDTH, RATE, MAX_K>,
+        config: SparsePathConfig<F, MAX_K>,
         layouter: &mut impl Layouter<F>,
         sparse_path: SparsePath<F, H>,
     ) -> Result<Self, Error> {
@@ -324,11 +274,10 @@ impl<
             siblings,
             direction_bits,
             is_active,
-            poseidon_chip: PoseidonChip::construct(config.poseidon_config),
+            poseidon_chip: Poseidon2Chip::construct(config.poseidon_config),
             swap_chip: ConditionalSwapChip::construct(config.swap_config, ()),
             cond_select_chip: ConditionalSelectChip::construct(config.cond_select_config, ()),
             is_eq_chip: IsEqualChip::construct(config.is_eq_config, ()),
-            _spec: PhantomData,
             _hasher: PhantomData,
         })
     }
@@ -382,7 +331,6 @@ mod test {
     use crate::measure;
     use crate::utilities::{AssertEqualChip, AssertEqualConfig};
     use ff::{Field, FromUniformBytes, PrimeField};
-    use halo2_gadgets::poseidon::primitives::Spec;
     use halo2_proofs::dev::MockProver;
     use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, SingleVerifier};
     use halo2_proofs::poly::commitment::Params;
@@ -393,51 +341,34 @@ mod test {
     };
     use pasta_curves::{EqAffine, Fp};
     use rand::rngs::OsRng;
-    use smt::poseidon::{FieldHasher, Poseidon, SmtP128Pow5T3};
+    use smt::poseidon::FieldHasher;
+    use smt::poseidon2::Poseidon2;
     use smt::smt::SparseMerkleTree;
     use std::clone::Clone;
     use std::marker::PhantomData;
     use std::time::Instant;
 
     #[derive(Clone)]
-    struct TestConfig<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const N: usize,
-    > {
-        path_config: PathConfig<F, S, WIDTH, RATE, N>,
+    struct TestConfig<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> {
+        path_config: PathConfig<F, N>,
         advices: [Column<Advice>; 3],
         assert_equal_config: AssertEqualConfig<F>,
         _hasher: PhantomData<H>,
     }
 
-    struct TestCircuit<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const N: usize,
-    > {
+    struct TestCircuit<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> {
         leaves: [F; 3],
         empty_leaf: [u8; 64],
         hasher: H,
-        _spec: PhantomData<S>,
     }
 
     impl<
             F: PrimeField + FromUniformBytes<64> + Ord,
-            S: Spec<F, WIDTH, RATE> + Clone,
             H: FieldHasher<F, 2> + Clone,
-            const WIDTH: usize,
-            const RATE: usize,
             const N: usize,
-        > Circuit<F> for TestCircuit<F, S, H, WIDTH, RATE, N>
+        > Circuit<F> for TestCircuit<F, H, N>
     {
-        type Config = TestConfig<F, S, H, WIDTH, RATE, N>;
+        type Config = TestConfig<F, H, N>;
         type FloorPlanner = SimpleFloorPlanner;
 
         fn without_witnesses(&self) -> Self {
@@ -445,7 +376,6 @@ mod test {
                 leaves: [F::ZERO, F::ZERO, F::ZERO],
                 empty_leaf: [0u8; 64],
                 hasher: H::hasher(),
-                _spec: PhantomData,
             }
         }
 
@@ -456,7 +386,7 @@ mod test {
                 .for_each(|column| meta.enable_equality(*column));
 
             TestConfig {
-                path_config: PathChip::<F, S, H, WIDTH, RATE, N>::configure(meta),
+                path_config: PathChip::<F, H, N>::configure(meta),
                 advices,
                 assert_equal_config: AssertEqualChip::configure(meta, [advices[0], advices[1]]),
                 _hasher: PhantomData,
@@ -506,7 +436,7 @@ mod test {
                 },
             )?;
 
-            let path_chip = PathChip::<F, S, H, WIDTH, RATE, N>::from_native(
+            let path_chip = PathChip::<F, H, N>::from_native(
                 config.path_config,
                 &mut layouter,
                 path,
@@ -530,11 +460,10 @@ mod test {
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 20;
 
-        let circuit = TestCircuit::<Fp, SmtP128Pow5T3<Fp, 0>, Poseidon<Fp, 2>, 3, 2, HEIGHT> {
+        let circuit = TestCircuit::<Fp, Poseidon2<Fp, 2>, HEIGHT> {
             leaves,
             empty_leaf,
-            hasher: Poseidon::<Fp, 2>::new(),
-            _spec: PhantomData,
+            hasher: Poseidon2::<Fp, 2>::new(),
         };
 
         let prover = MockProver::run(k, &circuit, vec![]).unwrap();
@@ -586,13 +515,11 @@ mod test {
 
         measure!(
             {
-                let circuit =
-                    TestCircuit::<Fp, SmtP128Pow5T3<Fp, 0>, Poseidon<Fp, 2>, 3, 2, HEIGHT> {
-                        leaves,
-                        empty_leaf,
-                        hasher: Poseidon::<Fp, 2>::new(),
-                        _spec: PhantomData,
-                    };
+                let circuit = TestCircuit::<Fp, Poseidon2<Fp, 2>, HEIGHT> {
+                    leaves,
+                    empty_leaf,
+                    hasher: Poseidon2::<Fp, 2>::new(),
+                };
 
                 let prover = MockProver::run(k, &circuit, vec![]).unwrap();
                 assert_eq!(prover.verify(), Ok(()));
@@ -619,15 +546,8 @@ mod test {
     // ========== Sparse Path Circuit Tests ==========
 
     #[derive(Clone)]
-    struct SparseTestConfig<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const MAX_K: usize,
-    > {
-        sparse_path_config: SparsePathConfig<F, S, WIDTH, RATE, MAX_K>,
+    struct SparseTestConfig<F: PrimeField, H: FieldHasher<F, 2>, const MAX_K: usize> {
+        sparse_path_config: SparsePathConfig<F, MAX_K>,
         advices: [Column<Advice>; 3],
         assert_equal_config: AssertEqualConfig<F>,
         _hasher: PhantomData<H>,
@@ -635,30 +555,23 @@ mod test {
 
     struct SparseTestCircuit<
         F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
         H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
         const N: usize,
         const MAX_K: usize,
     > {
         leaves: [F; 3],
         empty_leaf: [u8; 64],
         hasher: H,
-        _spec: PhantomData<S>,
     }
 
     impl<
             F: PrimeField + FromUniformBytes<64> + Ord,
-            S: Spec<F, WIDTH, RATE> + Clone,
             H: FieldHasher<F, 2> + Clone,
-            const WIDTH: usize,
-            const RATE: usize,
             const N: usize,
             const MAX_K: usize,
-        > Circuit<F> for SparseTestCircuit<F, S, H, WIDTH, RATE, N, MAX_K>
+        > Circuit<F> for SparseTestCircuit<F, H, N, MAX_K>
     {
-        type Config = SparseTestConfig<F, S, H, WIDTH, RATE, MAX_K>;
+        type Config = SparseTestConfig<F, H, MAX_K>;
         type FloorPlanner = SimpleFloorPlanner;
 
         fn without_witnesses(&self) -> Self {
@@ -666,7 +579,6 @@ mod test {
                 leaves: [F::ZERO; 3],
                 empty_leaf: [0u8; 64],
                 hasher: H::hasher(),
-                _spec: PhantomData,
             }
         }
 
@@ -677,7 +589,7 @@ mod test {
                 .for_each(|column| meta.enable_equality(*column));
 
             SparseTestConfig {
-                sparse_path_config: SparsePathChip::<F, S, H, WIDTH, RATE, MAX_K>::configure(meta),
+                sparse_path_config: SparsePathChip::<F, H, MAX_K>::configure(meta),
                 advices,
                 assert_equal_config: AssertEqualChip::configure(meta, [advices[0], advices[1]]),
                 _hasher: PhantomData,
@@ -726,7 +638,7 @@ mod test {
                 },
             )?;
 
-            let sparse_path_chip = SparsePathChip::<F, S, H, WIDTH, RATE, MAX_K>::from_native(
+            let sparse_path_chip = SparsePathChip::<F, H, MAX_K>::from_native(
                 config.sparse_path_config,
                 &mut layouter,
                 sparse_path.clone(),
@@ -757,19 +669,10 @@ mod test {
         const HEIGHT: usize = 10;
         const MAX_K: usize = 4;
 
-        let circuit = SparseTestCircuit::<
-            Fp,
-            SmtP128Pow5T3<Fp, 0>,
-            Poseidon<Fp, 2>,
-            3,
-            2,
-            HEIGHT,
-            MAX_K,
-        > {
+        let circuit = SparseTestCircuit::<Fp, Poseidon2<Fp, 2>, HEIGHT, MAX_K> {
             leaves,
             empty_leaf,
-            hasher: Poseidon::<Fp, 2>::new(),
-            _spec: PhantomData,
+            hasher: Poseidon2::<Fp, 2>::new(),
         };
 
         let prover = MockProver::run(k, &circuit, vec![]).unwrap();
@@ -786,19 +689,10 @@ mod test {
         const HEIGHT: usize = 20;
         const MAX_K: usize = 8;
 
-        let circuit = SparseTestCircuit::<
-            Fp,
-            SmtP128Pow5T3<Fp, 0>,
-            Poseidon<Fp, 2>,
-            3,
-            2,
-            HEIGHT,
-            MAX_K,
-        > {
+        let circuit = SparseTestCircuit::<Fp, Poseidon2<Fp, 2>, HEIGHT, MAX_K> {
             leaves,
             empty_leaf,
-            hasher: Poseidon::<Fp, 2>::new(),
-            _spec: PhantomData,
+            hasher: Poseidon2::<Fp, 2>::new(),
         };
 
         let prover = MockProver::run(k, &circuit, vec![]).unwrap();
@@ -847,11 +741,11 @@ mod test {
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 10;
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let hasher = Poseidon2::<Fp, 2>::new();
 
-        let smt = SparseMerkleTree::<Fp, Poseidon<Fp, 2>, HEIGHT>::new_sequential(
+        let smt = SparseMerkleTree::<Fp, Poseidon2<Fp, 2>, HEIGHT>::new_sequential(
             &leaves,
-            &poseidon,
+            &hasher,
             &empty_leaf,
         )
         .unwrap();
@@ -859,13 +753,13 @@ mod test {
         // Dense path: standard membership proof
         let dense_path = smt.generate_membership_proof(0);
         let dense_root = dense_path
-            .calculate_root(&leaves[0], &poseidon)
+            .calculate_root(&leaves[0], &hasher)
             .unwrap();
 
         // Sparse path: compact root + gap verification = standard root
         let sparse_path = smt.generate_sparse_membership_proof(0);
         let full_root = sparse_path
-            .calculate_full_root(&leaves[0], &poseidon, 0)
+            .calculate_full_root(&leaves[0], &hasher, 0)
             .unwrap();
 
         // Both should produce the same standard root
@@ -879,44 +773,26 @@ mod test {
     // ========== N=53 Realistic Benchmarks ==========
 
     #[derive(Clone)]
-    struct DenseBenchConfig<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const N: usize,
-    > {
-        path_config: PathConfig<F, S, WIDTH, RATE, N>,
+    struct DenseBenchConfig<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> {
+        path_config: PathConfig<F, N>,
         advices: [Column<Advice>; 3],
         assert_equal_config: AssertEqualConfig<F>,
         _hasher: PhantomData<H>,
     }
 
-    struct DenseBenchCircuit<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const N: usize,
-    > {
+    struct DenseBenchCircuit<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> {
         root: F,
         leaf: F,
         path: smt::smt::Path<F, H, N>,
-        _spec: PhantomData<S>,
     }
 
     impl<
             F: PrimeField + FromUniformBytes<64> + Ord,
-            S: Spec<F, WIDTH, RATE> + Clone,
             H: FieldHasher<F, 2> + Clone,
-            const WIDTH: usize,
-            const RATE: usize,
             const N: usize,
-        > Circuit<F> for DenseBenchCircuit<F, S, H, WIDTH, RATE, N>
+        > Circuit<F> for DenseBenchCircuit<F, H, N>
     {
-        type Config = DenseBenchConfig<F, S, H, WIDTH, RATE, N>;
+        type Config = DenseBenchConfig<F, H, N>;
         type FloorPlanner = SimpleFloorPlanner;
 
         fn without_witnesses(&self) -> Self {
@@ -928,7 +804,6 @@ mod test {
                     direction_bits: [false; N],
                     marker: PhantomData,
                 },
-                _spec: PhantomData,
             }
         }
 
@@ -939,7 +814,7 @@ mod test {
                 .for_each(|column| meta.enable_equality(*column));
 
             DenseBenchConfig {
-                path_config: PathChip::<F, S, H, WIDTH, RATE, N>::configure(meta),
+                path_config: PathChip::<F, H, N>::configure(meta),
                 advices,
                 assert_equal_config: AssertEqualChip::configure(meta, [advices[0], advices[1]]),
                 _hasher: PhantomData,
@@ -976,7 +851,7 @@ mod test {
                 },
             )?;
 
-            let path_chip = PathChip::<F, S, H, WIDTH, RATE, N>::from_native(
+            let path_chip = PathChip::<F, H, N>::from_native(
                 config.path_config,
                 &mut layouter,
                 self.path.clone(),
@@ -990,44 +865,26 @@ mod test {
     }
 
     #[derive(Clone)]
-    struct SparseBenchConfig<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const MAX_K: usize,
-    > {
-        sparse_path_config: SparsePathConfig<F, S, WIDTH, RATE, MAX_K>,
+    struct SparseBenchConfig<F: PrimeField, H: FieldHasher<F, 2>, const MAX_K: usize> {
+        sparse_path_config: SparsePathConfig<F, MAX_K>,
         advices: [Column<Advice>; 3],
         assert_equal_config: AssertEqualConfig<F>,
         _hasher: PhantomData<H>,
     }
 
-    struct SparseBenchCircuit<
-        F: PrimeField,
-        S: Spec<F, WIDTH, RATE>,
-        H: FieldHasher<F, 2>,
-        const WIDTH: usize,
-        const RATE: usize,
-        const MAX_K: usize,
-    > {
+    struct SparseBenchCircuit<F: PrimeField, H: FieldHasher<F, 2>, const MAX_K: usize> {
         compact_root: F,
         leaf: F,
         sparse_path: smt::smt::SparsePath<F, H>,
-        _spec: PhantomData<S>,
     }
 
     impl<
             F: PrimeField + FromUniformBytes<64> + Ord,
-            S: Spec<F, WIDTH, RATE> + Clone,
             H: FieldHasher<F, 2> + Clone,
-            const WIDTH: usize,
-            const RATE: usize,
             const MAX_K: usize,
-        > Circuit<F> for SparseBenchCircuit<F, S, H, WIDTH, RATE, MAX_K>
+        > Circuit<F> for SparseBenchCircuit<F, H, MAX_K>
     {
-        type Config = SparseBenchConfig<F, S, H, WIDTH, RATE, MAX_K>;
+        type Config = SparseBenchConfig<F, H, MAX_K>;
         type FloorPlanner = SimpleFloorPlanner;
 
         fn without_witnesses(&self) -> Self {
@@ -1040,7 +897,6 @@ mod test {
                     empty_hashes: Vec::new(),
                     marker: PhantomData,
                 },
-                _spec: PhantomData,
             }
         }
 
@@ -1051,9 +907,7 @@ mod test {
                 .for_each(|column| meta.enable_equality(*column));
 
             SparseBenchConfig {
-                sparse_path_config: SparsePathChip::<F, S, H, WIDTH, RATE, MAX_K>::configure(
-                    meta,
-                ),
+                sparse_path_config: SparsePathChip::<F, H, MAX_K>::configure(meta),
                 advices,
                 assert_equal_config: AssertEqualChip::configure(meta, [advices[0], advices[1]]),
                 _hasher: PhantomData,
@@ -1090,7 +944,7 @@ mod test {
                 },
             )?;
 
-            let sparse_path_chip = SparsePathChip::<F, S, H, WIDTH, RATE, MAX_K>::from_native(
+            let sparse_path_chip = SparsePathChip::<F, H, MAX_K>::from_native(
                 config.sparse_path_config,
                 &mut layouter,
                 self.sparse_path.clone(),
@@ -1110,7 +964,7 @@ mod test {
 
         let rng = OsRng;
         let empty_leaf = [0u8; 64];
-        let hasher = Poseidon::<Fp, 2>::new();
+        let hasher = Poseidon2::<Fp, 2>::new();
         const HEIGHT: usize = 53;
         const MAX_K: usize = 32;
 
@@ -1126,7 +980,7 @@ mod test {
 
         println!("Building SMT with HEIGHT={}, {} leaves...", HEIGHT, leaf_map.len());
         let now = Instant::now();
-        let smt = SparseMerkleTree::<Fp, Poseidon<Fp, 2>, HEIGHT>::new(
+        let smt = SparseMerkleTree::<Fp, Poseidon2<Fp, 2>, HEIGHT>::new(
             &leaf_map,
             &hasher,
             &empty_leaf,
@@ -1155,18 +1009,10 @@ mod test {
         // ===== Dense Benchmark =====
         println!("===== Dense PathChip (N={}) =====", HEIGHT);
 
-        let dense_circuit = DenseBenchCircuit::<
-            Fp,
-            SmtP128Pow5T3<Fp, 0>,
-            Poseidon<Fp, 2>,
-            3,
-            2,
-            HEIGHT,
-        > {
+        let dense_circuit = DenseBenchCircuit::<Fp, Poseidon2<Fp, 2>, HEIGHT> {
             root: dense_root,
             leaf: leaf0,
             path: dense_path,
-            _spec: PhantomData,
         };
 
         let k_dense = 12;
@@ -1208,18 +1054,10 @@ mod test {
         // ===== Sparse Benchmark =====
         println!("\n===== Sparse SparsePathChip (MAX_K={}) =====", MAX_K);
 
-        let sparse_circuit = SparseBenchCircuit::<
-            Fp,
-            SmtP128Pow5T3<Fp, 0>,
-            Poseidon<Fp, 2>,
-            3,
-            2,
-            MAX_K,
-        > {
+        let sparse_circuit = SparseBenchCircuit::<Fp, Poseidon2<Fp, 2>, MAX_K> {
             compact_root,
             leaf: leaf0,
             sparse_path: sparse_proof,
-            _spec: PhantomData,
         };
 
         let k_sparse = 12;

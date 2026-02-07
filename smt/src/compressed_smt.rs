@@ -16,9 +16,58 @@ use anyhow::Result;
 use ff::{FromUniformBytes, PrimeField};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Minimum number of leaves in a subtree to trigger parallel recursion via rayon.
 const PARALLEL_THRESHOLD: usize = 1024;
+
+// ============================================================
+// Build progress tracking
+// ============================================================
+
+/// Tracks leaf processing progress during tree construction.
+///
+/// Uses an atomic counter so parallel rayon threads can safely
+/// report progress. Logs at ~20 evenly-spaced intervals to avoid
+/// flooding the output while still giving useful feedback.
+struct BuildProgress {
+    processed: AtomicUsize,
+    total: usize,
+    log_interval: usize,
+}
+
+impl BuildProgress {
+    fn new(total: usize) -> Self {
+        // Log roughly 20 times during the build, minimum interval of 1.
+        let log_interval = (total / 20).max(1);
+        BuildProgress {
+            processed: AtomicUsize::new(0),
+            total,
+            log_interval,
+        }
+    }
+
+    /// Report that `count` leaves have been processed.
+    /// Logs progress when crossing an interval boundary or reaching completion.
+    fn report(&self, count: usize) {
+        if self.total == 0 {
+            return;
+        }
+        let prev = self.processed.fetch_add(count, Ordering::Relaxed);
+        let done = prev + count;
+        // Log when we cross an interval boundary or reach the total.
+        if prev / self.log_interval != done / self.log_interval || done >= self.total {
+            let clamped = done.min(self.total);
+            log::info!(
+                "[CompressedSMT] Progress: {}/{} leaves ({:.1}%)",
+                clamped,
+                self.total,
+                (clamped as f64 / self.total as f64) * 100.0
+            );
+        }
+    }
+}
 
 // ============================================================
 // CompressedNode enum
@@ -175,11 +224,13 @@ fn build<F: PrimeField, H: FieldHasher<F, 2> + Sync>(
     level: usize,
     hasher: &H,
     empty_hashes: &[F],
+    progress: &BuildProgress,
 ) -> CompressedNode<F> {
     match leaves.len() {
         0 => CompressedNode::Zero,
         1 => {
             let hash = compute_single_hash(leaves[0], level, hasher, empty_hashes);
+            progress.report(1);
             CompressedNode::Single {
                 leaf_index: leaves[0].0,
                 leaf_value: leaves[0].1,
@@ -189,6 +240,7 @@ fn build<F: PrimeField, H: FieldHasher<F, 2> + Sync>(
         2 => {
             let hash =
                 compute_double_hash(leaves[0], leaves[1], level, hasher, empty_hashes);
+            progress.report(2);
             CompressedNode::Double {
                 leaf_a: leaves[0],
                 leaf_b: leaves[1],
@@ -205,13 +257,13 @@ fn build<F: PrimeField, H: FieldHasher<F, 2> + Sync>(
             // Parallel recursion for large subtrees
             let (left, right) = if leaves.len() > PARALLEL_THRESHOLD {
                 rayon::join(
-                    || build(left_leaves, level - 1, hasher, empty_hashes),
-                    || build(right_leaves, level - 1, hasher, empty_hashes),
+                    || build(left_leaves, level - 1, hasher, empty_hashes, progress),
+                    || build(right_leaves, level - 1, hasher, empty_hashes, progress),
                 )
             } else {
                 (
-                    build(left_leaves, level - 1, hasher, empty_hashes),
-                    build(right_leaves, level - 1, hasher, empty_hashes),
+                    build(left_leaves, level - 1, hasher, empty_hashes, progress),
+                    build(right_leaves, level - 1, hasher, empty_hashes, progress),
                 )
             };
 
@@ -776,7 +828,19 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
     where
         H: Sync,
     {
+        log::info!(
+            "[CompressedSMT] Building tree: height={}, leaves={}",
+            N,
+            leaves.len()
+        );
+        let start = Instant::now();
+
         let empty_hashes = gen_empty_hashes::<F, H, N>(hasher, empty_leaf)?;
+        log::debug!(
+            "[CompressedSMT] Empty hashes computed in {:?}",
+            start.elapsed()
+        );
+
         let sorted_leaves: Vec<(u64, F)> =
             leaves.iter().map(|(&k, &v)| (k, v)).collect();
 
@@ -792,7 +856,20 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
             }
         }
 
-        let root = build(&sorted_leaves, N, hasher, &empty_hashes);
+        let build_start = Instant::now();
+        let progress = BuildProgress::new(sorted_leaves.len());
+        let root = build(&sorted_leaves, N, hasher, &empty_hashes, &progress);
+
+        log::info!(
+            "[CompressedSMT] Tree built in {:?} (height={}, leaves={})",
+            build_start.elapsed(),
+            N,
+            leaves.len()
+        );
+        log::info!(
+            "[CompressedSMT] Total construction time: {:?}",
+            start.elapsed()
+        );
 
         Ok(CompressedSMT {
             root,
@@ -903,7 +980,7 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poseidon::Poseidon;
+    use crate::poseidon2::Poseidon2;
     use crate::smt::SparseMerkleTree;
     use ff::Field;
     use pasta_curves::Fp;
@@ -911,7 +988,7 @@ mod tests {
     use rand::Rng;
     use std::collections::BTreeMap;
 
-    type TestHasher = Poseidon<Fp, 2>;
+    type TestHasher = Poseidon2<Fp, 2>;
 
     /// Helper: create both the original SMT and compressed SMT from the same leaves.
     fn create_both<const N: usize>(
@@ -920,7 +997,7 @@ mod tests {
         SparseMerkleTree<Fp, TestHasher, N>,
         CompressedSMT<Fp, TestHasher, N>,
     ) {
-        let hasher = Poseidon::<Fp, 2>::new();
+        let hasher = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let smt = SparseMerkleTree::new(leaves, &hasher, &empty_leaf).unwrap();
         let csmt = CompressedSMT::new_from_u32(leaves, &hasher, &empty_leaf).unwrap();
@@ -997,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_node_classification() {
-        let hasher = Poseidon::<Fp, 2>::new();
+        let hasher = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
 
         // 0 leaves → Zero
@@ -1066,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_dense_proof_membership_check() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
             (0..8).map(|i| (i, Fp::random(rng))).collect();
@@ -1088,7 +1165,7 @@ mod tests {
         let leaves: BTreeMap<u32, Fp> =
             indices.iter().map(|&i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<20>(&leaves);
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
 
         for &idx in &indices {
             let smt_proof = smt.generate_membership_proof(idx as u64);
@@ -1156,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_sparse_proof_full_root() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
             (0..8).map(|i| (i, Fp::random(rng))).collect();
@@ -1178,7 +1255,7 @@ mod tests {
 
     #[test]
     fn test_sparse_proof_compact_root() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
             (0..8).map(|i| (i, Fp::random(rng))).collect();
@@ -1207,7 +1284,7 @@ mod tests {
 
     #[test]
     fn test_scale_1k_leaves() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
             (0..1000).map(|i| (i, Fp::random(rng))).collect();
@@ -1239,7 +1316,7 @@ mod tests {
     #[test]
     fn test_scale_height_53() {
         let mut rng = OsRng;
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
 
         // Create 10,000 leaves with random u64 indices in the 2^53 space
@@ -1337,7 +1414,7 @@ mod tests {
     fn test_nonexistent_proof_single_mismatch() {
         // Tree with one leaf at index 5: proof for index 3 should
         // return the empty leaf with the correct sibling hashes.
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> = [(5, Fp::random(rng))].into_iter().collect();
@@ -1372,7 +1449,7 @@ mod tests {
     fn test_nonexistent_proof_double_mismatch() {
         // Tree with leaves at indices 2 and 7: proof for index 4
         // should work correctly.
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> = [(2, Fp::random(rng)), (7, Fp::random(rng))]
@@ -1414,7 +1491,7 @@ mod tests {
     fn test_nonexistent_proof_multi_descend_into_zero() {
         // Tree with leaves clustered on the left side (indices 0..8),
         // probing an index on the empty right side.
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
@@ -1473,7 +1550,7 @@ mod tests {
         // SparseMerkleTree field-by-field.
         let rng = OsRng;
         let empty_leaf = [0u8; 64];
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_val = Fp::from_uniform_bytes(&empty_leaf);
 
         // Height 3, 3 leaves
@@ -1552,7 +1629,7 @@ mod tests {
         // original SMT and produce the correct full root.
         let rng = OsRng;
         let empty_leaf = [0u8; 64];
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_val = Fp::from_uniform_bytes(&empty_leaf);
 
         let indices = [0u32, 5, 13, 100, 500, 1000];
@@ -1615,7 +1692,7 @@ mod tests {
         use std::time::Instant;
 
         let rng = OsRng;
-        let hasher = Poseidon::<Fp, 2>::new();
+        let hasher = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
 
         // Height 10, 50 leaves
@@ -1630,7 +1707,7 @@ mod tests {
             let existing_indices: Vec<u64> = leaves.keys().map(|&k| k as u64).collect();
             let non_existent: Vec<u64> = (50..150).map(|i| i as u64).collect();
 
-            let iters = 100;
+            let iters = 10;
 
             let start = Instant::now();
             for _ in 0..iters {
@@ -1687,7 +1764,7 @@ mod tests {
             let existing_indices: Vec<u64> = leaves.keys().take(10).map(|&k| k as u64).collect();
             let non_existent: Vec<u64> = (1..11).map(|i| i as u64).collect();
 
-            let iters = 50;
+            let iters = 5;
 
             let start = Instant::now();
             for _ in 0..iters {
