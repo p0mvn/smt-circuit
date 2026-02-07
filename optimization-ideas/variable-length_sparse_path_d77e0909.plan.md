@@ -1,5 +1,6 @@
 ---
 name: Variable-length sparse path
+status: reverted
 overview: Add a `SparsePath` native data structure and `SparsePathChip` circuit that processes only K non-zero sibling levels instead of all N levels, reducing circuit rows by ~80% for sparse trees. Gap levels (where siblings are empty hashes) are verified natively outside the circuit.
 todos:
   - id: native-types
