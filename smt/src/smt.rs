@@ -38,6 +38,7 @@
 use crate::poseidon::FieldHasher;
 use anyhow::{Error, Result};
 use ff::{FromUniformBytes, PrimeField};
+use std::time::Instant;
 use std::{
     borrow::ToOwned,
     collections::{BTreeMap, BTreeSet},
