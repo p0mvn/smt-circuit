@@ -21,7 +21,7 @@ use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Value},
     plonk::{Advice, Column, ConstraintSystem, Error, Selector},
 };
-use smt::poseidon::FieldHasher;
+use smt::poseidon2::FieldHasher;
 use smt::smt::{Path, SparsePath};
 use std::marker::PhantomData;
 
@@ -343,7 +343,7 @@ mod test {
     };
     use pasta_curves::{EqAffine, Fp};
     use rand::rngs::OsRng;
-    use smt::poseidon::FieldHasher;
+    use smt::poseidon2::FieldHasher;
     use smt::poseidon2::Poseidon2;
     use smt::smt::SparseMerkleTree;
     use std::clone::Clone;

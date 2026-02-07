@@ -35,7 +35,7 @@
 //! the nodes. Then the merkle proof path `e-b-a` from leaf `e` to root `a` is
 //! stored as `[(d,e), (b,c)]`
 
-use crate::poseidon::FieldHasher;
+use crate::poseidon2::FieldHasher;
 use anyhow::{Error, Result};
 use ff::{FromUniformBytes, PrimeField};
 use std::time::Instant;
@@ -555,7 +555,7 @@ fn parent(index: u64) -> Option<u64> {
 #[cfg(test)]
 mod test {
     use super::{gen_empty_hashes, SparseMerkleTree};
-    use crate::poseidon::FieldHasher;
+    use crate::poseidon2::FieldHasher;
     use crate::poseidon2::Poseidon2;
     use ff::{Field, FromUniformBytes, PrimeField};
     use pasta_curves::Fp;

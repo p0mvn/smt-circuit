@@ -22,10 +22,18 @@
 //! - Reference implementation: <https://github.com/amit0365/poseidon2>
 //! - Round constants generated via Grain LFSR (see `poseidon2_params.rs`).
 
-use crate::poseidon::FieldHasher;
 use crate::poseidon2_params::{MAT_INTERNAL_DIAG_M_1, ROUND_CONSTANTS};
 use anyhow::Result;
 use ff::{FromUniformBytes, PrimeField};
+
+/// Trait for hashing fixed-length field element arrays.
+///
+/// Any hash function mapping `[F; L] -> F` can implement this trait
+/// to be used as the hasher in a Sparse Merkle Tree.
+pub trait FieldHasher<F: PrimeField, const L: usize> {
+    fn hash(&self, inputs: [F; L]) -> Result<F>;
+    fn hasher() -> Self;
+}
 // ---- Poseidon2 constants ----
 
 pub const T: usize = 3; // state width
@@ -212,8 +220,7 @@ fn poseidon2_hash<F: PrimeField, const L: usize>(inputs: [F; L], params: &Poseid
 
 /// Poseidon2 hasher implementing [`FieldHasher`].
 ///
-/// Drop-in replacement for [`crate::poseidon::Poseidon`] that uses the Poseidon2
-/// permutation instead of Poseidon1.
+/// Poseidon2 hasher using the Poseidon2 permutation.
 ///
 /// Generic over field `F` and input length `L` (typically `L = 2` for Merkle
 /// tree hashing).

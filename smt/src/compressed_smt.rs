@@ -10,7 +10,7 @@
 //!
 //! Construction uses rayon for multi-core parallelism on large subtrees.
 
-use crate::poseidon::FieldHasher;
+use crate::poseidon2::FieldHasher;
 use crate::smt::{gen_empty_hashes, Path, SparsePath, SparsePathEntry};
 use anyhow::Result;
 use ff::{FromUniformBytes, PrimeField};
