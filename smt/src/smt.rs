@@ -555,7 +555,8 @@ fn parent(index: u64) -> Option<u64> {
 #[cfg(test)]
 mod test {
     use super::{gen_empty_hashes, SparseMerkleTree};
-    use crate::poseidon::{FieldHasher, Poseidon};
+    use crate::poseidon::FieldHasher;
+    use crate::poseidon2::Poseidon2;
     use ff::{Field, FromUniformBytes, PrimeField};
     use pasta_curves::Fp;
     use rand::rngs::OsRng;
@@ -578,12 +579,12 @@ mod test {
 
     #[test]
     fn should_create_tree_poseidon() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let default_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 3;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
+        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
             poseidon.clone(),
             &leaves,
             &default_leaf,
@@ -592,7 +593,7 @@ mod test {
         let root = smt.root();
 
         let empty_hashes =
-            gen_empty_hashes::<Fp, Poseidon<Fp, 2>, HEIGHT>(&poseidon, &default_leaf).unwrap();
+            gen_empty_hashes::<Fp, Poseidon2<Fp, 2>, HEIGHT>(&poseidon, &default_leaf).unwrap();
         let hash1 = leaves[0];
         let hash2 = leaves[1];
         let hash3 = leaves[2];
@@ -608,12 +609,12 @@ mod test {
 
     #[test]
     fn should_generate_and_validate_proof_poseidon() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let default_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 3;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
+        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
             poseidon.clone(),
             &leaves,
             &default_leaf,
@@ -629,12 +630,12 @@ mod test {
 
     #[test]
     fn should_find_the_index_poseidon() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let default_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 3;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
+        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
             poseidon.clone(),
             &leaves,
             &default_leaf,
@@ -656,12 +657,12 @@ mod test {
 
     #[test]
     fn test_sparse_proof_generation() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let default_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 20;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
+        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
             poseidon.clone(),
             &leaves,
             &default_leaf,
@@ -686,12 +687,12 @@ mod test {
 
     #[test]
     fn test_compact_root_matches() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let default_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 20;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
+        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
             poseidon.clone(),
             &leaves,
             &default_leaf,
@@ -717,12 +718,12 @@ mod test {
 
     #[test]
     fn test_full_root_matches_standard() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let default_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 20;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
+        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
             poseidon.clone(),
             &leaves,
             &default_leaf,
@@ -744,12 +745,12 @@ mod test {
 
     #[test]
     fn test_sparse_roundtrip() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let default_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
         const HEIGHT: usize = 20;
-        let smt = create_merkle_tree::<Fp, Poseidon<Fp, 2>, HEIGHT>(
+        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
             poseidon.clone(),
             &leaves,
             &default_leaf,

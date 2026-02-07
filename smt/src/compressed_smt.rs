@@ -15,10 +15,60 @@ use crate::smt::{gen_empty_hashes, Path, SparsePath, SparsePathEntry};
 use anyhow::Result;
 use ff::{FromUniformBytes, PrimeField};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Minimum number of leaves in a subtree to trigger parallel recursion via rayon.
 const PARALLEL_THRESHOLD: usize = 1024;
+
+// ============================================================
+// Build progress tracking
+// ============================================================
+
+/// Tracks leaf processing progress during tree construction.
+///
+/// Uses an atomic counter so parallel rayon threads can safely
+/// report progress. Logs at ~20 evenly-spaced intervals to avoid
+/// flooding the output while still giving useful feedback.
+struct BuildProgress {
+    processed: AtomicUsize,
+    total: usize,
+    log_interval: usize,
+}
+
+impl BuildProgress {
+    fn new(total: usize) -> Self {
+        // Log roughly 20 times during the build, minimum interval of 1.
+        let log_interval = (total / 20).max(1);
+        BuildProgress {
+            processed: AtomicUsize::new(0),
+            total,
+            log_interval,
+        }
+    }
+
+    /// Report that `count` leaves have been processed.
+    /// Logs progress when crossing an interval boundary or reaching completion.
+    fn report(&self, count: usize) {
+        if self.total == 0 {
+            return;
+        }
+        let prev = self.processed.fetch_add(count, Ordering::Relaxed);
+        let done = prev + count;
+        // Log when we cross an interval boundary or reach the total.
+        if prev / self.log_interval != done / self.log_interval || done >= self.total {
+            let clamped = done.min(self.total);
+            log::info!(
+                "[CompressedSMT] Progress: {}/{} leaves ({:.1}%)",
+                clamped,
+                self.total,
+                (clamped as f64 / self.total as f64) * 100.0
+            );
+        }
+    }
+}
 
 // ============================================================
 // CompressedNode enum
@@ -175,11 +225,13 @@ fn build<F: PrimeField, H: FieldHasher<F, 2> + Sync>(
     level: usize,
     hasher: &H,
     empty_hashes: &[F],
+    progress: &BuildProgress,
 ) -> CompressedNode<F> {
     match leaves.len() {
         0 => CompressedNode::Zero,
         1 => {
             let hash = compute_single_hash(leaves[0], level, hasher, empty_hashes);
+            progress.report(1);
             CompressedNode::Single {
                 leaf_index: leaves[0].0,
                 leaf_value: leaves[0].1,
@@ -189,6 +241,7 @@ fn build<F: PrimeField, H: FieldHasher<F, 2> + Sync>(
         2 => {
             let hash =
                 compute_double_hash(leaves[0], leaves[1], level, hasher, empty_hashes);
+            progress.report(2);
             CompressedNode::Double {
                 leaf_a: leaves[0],
                 leaf_b: leaves[1],
@@ -205,13 +258,13 @@ fn build<F: PrimeField, H: FieldHasher<F, 2> + Sync>(
             // Parallel recursion for large subtrees
             let (left, right) = if leaves.len() > PARALLEL_THRESHOLD {
                 rayon::join(
-                    || build(left_leaves, level - 1, hasher, empty_hashes),
-                    || build(right_leaves, level - 1, hasher, empty_hashes),
+                    || build(left_leaves, level - 1, hasher, empty_hashes, progress),
+                    || build(right_leaves, level - 1, hasher, empty_hashes, progress),
                 )
             } else {
                 (
-                    build(left_leaves, level - 1, hasher, empty_hashes),
-                    build(right_leaves, level - 1, hasher, empty_hashes),
+                    build(left_leaves, level - 1, hasher, empty_hashes, progress),
+                    build(right_leaves, level - 1, hasher, empty_hashes, progress),
                 )
             };
 
@@ -776,7 +829,19 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
     where
         H: Sync,
     {
+        log::info!(
+            "[CompressedSMT] Building tree: height={}, leaves={}",
+            N,
+            leaves.len()
+        );
+        let start = Instant::now();
+
         let empty_hashes = gen_empty_hashes::<F, H, N>(hasher, empty_leaf)?;
+        log::debug!(
+            "[CompressedSMT] Empty hashes computed in {:?}",
+            start.elapsed()
+        );
+
         let sorted_leaves: Vec<(u64, F)> =
             leaves.iter().map(|(&k, &v)| (k, v)).collect();
 
@@ -792,7 +857,20 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
             }
         }
 
-        let root = build(&sorted_leaves, N, hasher, &empty_hashes);
+        let build_start = Instant::now();
+        let progress = BuildProgress::new(sorted_leaves.len());
+        let root = build(&sorted_leaves, N, hasher, &empty_hashes, &progress);
+
+        log::info!(
+            "[CompressedSMT] Tree built in {:?} (height={}, leaves={})",
+            build_start.elapsed(),
+            N,
+            leaves.len()
+        );
+        log::info!(
+            "[CompressedSMT] Total construction time: {:?}",
+            start.elapsed()
+        );
 
         Ok(CompressedSMT {
             root,
@@ -894,6 +972,259 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
     fn root_node(&self) -> &CompressedNode<F> {
         &self.root
     }
+
+    /// Serialize the tree to a writer in binary format.
+    ///
+    /// Format:
+    /// - Magic: `CSMT0001` (8 bytes)
+    /// - Tree height N: u64 LE (8 bytes)
+    /// - Empty hashes: N * 32 bytes (each field element via `to_repr()`)
+    /// - Root: recursive `CompressedNode` serialization
+    pub fn serialize_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        // Magic header
+        writer.write_all(SERIALIZE_MAGIC)?;
+        // Tree height
+        writer.write_all(&(N as u64).to_le_bytes())?;
+        // Empty hashes
+        for h in &self.empty_hashes {
+            writer.write_all(h.to_repr().as_ref())?;
+        }
+        // Root node
+        write_node(&self.root, writer)?;
+        Ok(())
+    }
+
+    /// Deserialize a tree from a reader.
+    ///
+    /// Validates magic header and that the stored tree height matches
+    /// the const generic `N`.
+    pub fn deserialize_from<R: Read>(reader: &mut R) -> Result<Self> {
+        // Read and verify magic
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != SERIALIZE_MAGIC {
+            anyhow::bail!(
+                "Invalid CompressedSMT cache magic: expected {:?}, got {:?}",
+                SERIALIZE_MAGIC,
+                &magic
+            );
+        }
+
+        // Read and verify tree height
+        let mut height_bytes = [0u8; 8];
+        reader.read_exact(&mut height_bytes)?;
+        let stored_height = u64::from_le_bytes(height_bytes) as usize;
+        if stored_height != N {
+            anyhow::bail!(
+                "Tree height mismatch: cache has {}, expected {}",
+                stored_height,
+                N
+            );
+        }
+
+        // Read empty hashes
+        let mut empty_hashes = [F::ZERO; N];
+        for h in empty_hashes.iter_mut() {
+            *h = read_field_element(reader)?;
+        }
+
+        // Read root node
+        let root = read_node(reader)?;
+
+        Ok(CompressedSMT {
+            root,
+            empty_hashes,
+            marker: PhantomData,
+        })
+    }
+}
+
+// ============================================================
+// Binary serialization helpers
+// ============================================================
+
+/// Magic header for CompressedSMT binary serialization format.
+const SERIALIZE_MAGIC: &[u8; 8] = b"CSMT0001";
+
+/// Tag bytes for CompressedNode variants.
+const TAG_ZERO: u8 = 0;
+const TAG_SINGLE: u8 = 1;
+const TAG_DOUBLE: u8 = 2;
+const TAG_MULTI: u8 = 3;
+
+/// Write a field element as 32 bytes (little-endian representation).
+fn write_field_element<F: PrimeField, W: Write>(f: &F, w: &mut W) -> Result<()> {
+    w.write_all(f.to_repr().as_ref())?;
+    Ok(())
+}
+
+/// Read a field element from 32 bytes.
+fn read_field_element<F: PrimeField, R: Read>(r: &mut R) -> Result<F> {
+    let mut repr = F::Repr::default();
+    r.read_exact(repr.as_mut())?;
+    let opt = F::from_repr(repr);
+    if opt.is_some().into() {
+        Ok(opt.unwrap())
+    } else {
+        anyhow::bail!("Invalid field element in cache")
+    }
+}
+
+/// Serialize a CompressedNode recursively.
+///
+/// Uses an explicit stack to avoid deep recursion stack overflow on
+/// trees with millions of Multi nodes (depth can reach ~50+ levels
+/// of Multi nesting for 51.7M leaves).
+fn write_node<F: PrimeField, W: Write>(root: &CompressedNode<F>, w: &mut W) -> Result<()> {
+    // Stack of nodes to serialize. We process them in order, pushing
+    // Multi children in reverse (right then left) so left is written first.
+    let mut stack: Vec<&CompressedNode<F>> = vec![root];
+
+    while let Some(node) = stack.pop() {
+        match node {
+            CompressedNode::Zero => {
+                w.write_all(&[TAG_ZERO])?;
+            }
+            CompressedNode::Single {
+                leaf_index,
+                leaf_value,
+                hash,
+            } => {
+                w.write_all(&[TAG_SINGLE])?;
+                w.write_all(&leaf_index.to_le_bytes())?;
+                write_field_element(leaf_value, w)?;
+                write_field_element(hash, w)?;
+            }
+            CompressedNode::Double {
+                leaf_a,
+                leaf_b,
+                hash,
+            } => {
+                w.write_all(&[TAG_DOUBLE])?;
+                w.write_all(&leaf_a.0.to_le_bytes())?;
+                write_field_element(&leaf_a.1, w)?;
+                w.write_all(&leaf_b.0.to_le_bytes())?;
+                write_field_element(&leaf_b.1, w)?;
+                write_field_element(hash, w)?;
+            }
+            CompressedNode::Multi { hash, left, right } => {
+                w.write_all(&[TAG_MULTI])?;
+                write_field_element(hash, w)?;
+                // Push right first so left is processed first (stack is LIFO)
+                stack.push(right);
+                stack.push(left);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deserialize a CompressedNode from a reader.
+///
+/// Uses an explicit stack to mirror the iterative write_node approach
+/// and avoid deep recursion stack overflow.
+fn read_node<F: PrimeField, R: Read>(r: &mut R) -> Result<CompressedNode<F>> {
+    // We reconstruct the tree iteratively. The idea:
+    // - Read tags sequentially (same order as written).
+    // - For Zero/Single/Double: the node is complete immediately.
+    // - For Multi: we know left and right follow. We push a "pending Multi"
+    //   marker and track how many children we still need.
+    //
+    // We use two stacks:
+    // - `pending`: tracks Multi nodes waiting for children (hash, Option<left>, needs_right)
+    // - When a complete node is produced, we try to attach it to the
+    //   innermost pending Multi.
+
+    enum Slot<F: PrimeField> {
+        /// Multi node waiting for both children.
+        NeedBoth { hash: F },
+        /// Multi node that has its left child, waiting for right.
+        NeedRight { hash: F, left: CompressedNode<F> },
+    }
+
+    let mut pending: Vec<Slot<F>> = Vec::new();
+
+    loop {
+        // Read the next node tag
+        let mut tag = [0u8; 1];
+        r.read_exact(&mut tag)?;
+
+        let node = match tag[0] {
+            TAG_ZERO => CompressedNode::Zero,
+            TAG_SINGLE => {
+                let mut idx_bytes = [0u8; 8];
+                r.read_exact(&mut idx_bytes)?;
+                let leaf_index = u64::from_le_bytes(idx_bytes);
+                let leaf_value = read_field_element(r)?;
+                let hash = read_field_element(r)?;
+                CompressedNode::Single {
+                    leaf_index,
+                    leaf_value,
+                    hash,
+                }
+            }
+            TAG_DOUBLE => {
+                let mut idx_a = [0u8; 8];
+                r.read_exact(&mut idx_a)?;
+                let leaf_a_index = u64::from_le_bytes(idx_a);
+                let leaf_a_value = read_field_element(r)?;
+                let mut idx_b = [0u8; 8];
+                r.read_exact(&mut idx_b)?;
+                let leaf_b_index = u64::from_le_bytes(idx_b);
+                let leaf_b_value = read_field_element(r)?;
+                let hash = read_field_element(r)?;
+                CompressedNode::Double {
+                    leaf_a: (leaf_a_index, leaf_a_value),
+                    leaf_b: (leaf_b_index, leaf_b_value),
+                    hash,
+                }
+            }
+            TAG_MULTI => {
+                let hash = read_field_element(r)?;
+                // Push a pending slot — left child comes next in the stream
+                pending.push(Slot::NeedBoth { hash });
+                continue; // Don't try to resolve yet, read next node
+            }
+            other => {
+                anyhow::bail!("Invalid CompressedNode tag in cache: {}", other);
+            }
+        };
+
+        // We have a complete `node`. Try to attach it to pending Multi parents.
+        let mut completed = node;
+        loop {
+            match pending.last_mut() {
+                Some(Slot::NeedBoth { .. }) => {
+                    // This completed node is the left child
+                    let slot = pending.pop().unwrap();
+                    if let Slot::NeedBoth { hash } = slot {
+                        pending.push(Slot::NeedRight {
+                            hash,
+                            left: completed,
+                        });
+                    }
+                    break; // Need to read more for the right child
+                }
+                Some(Slot::NeedRight { .. }) => {
+                    // This completed node is the right child — assemble Multi
+                    let slot = pending.pop().unwrap();
+                    if let Slot::NeedRight { hash, left } = slot {
+                        completed = CompressedNode::Multi {
+                            hash,
+                            left: Box::new(left),
+                            right: Box::new(completed),
+                        };
+                        // This assembled Multi may itself be a child of another
+                        // pending parent, so loop again.
+                    }
+                }
+                None => {
+                    // No pending parents — this is the root node
+                    return Ok(completed);
+                }
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -903,7 +1234,7 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poseidon::Poseidon;
+    use crate::poseidon2::Poseidon2;
     use crate::smt::SparseMerkleTree;
     use ff::Field;
     use pasta_curves::Fp;
@@ -911,7 +1242,7 @@ mod tests {
     use rand::Rng;
     use std::collections::BTreeMap;
 
-    type TestHasher = Poseidon<Fp, 2>;
+    type TestHasher = Poseidon2<Fp, 2>;
 
     /// Helper: create both the original SMT and compressed SMT from the same leaves.
     fn create_both<const N: usize>(
@@ -920,7 +1251,7 @@ mod tests {
         SparseMerkleTree<Fp, TestHasher, N>,
         CompressedSMT<Fp, TestHasher, N>,
     ) {
-        let hasher = Poseidon::<Fp, 2>::new();
+        let hasher = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let smt = SparseMerkleTree::new(leaves, &hasher, &empty_leaf).unwrap();
         let csmt = CompressedSMT::new_from_u32(leaves, &hasher, &empty_leaf).unwrap();
@@ -997,7 +1328,7 @@ mod tests {
 
     #[test]
     fn test_node_classification() {
-        let hasher = Poseidon::<Fp, 2>::new();
+        let hasher = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
 
         // 0 leaves → Zero
@@ -1066,7 +1397,7 @@ mod tests {
 
     #[test]
     fn test_dense_proof_membership_check() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
             (0..8).map(|i| (i, Fp::random(rng))).collect();
@@ -1088,7 +1419,7 @@ mod tests {
         let leaves: BTreeMap<u32, Fp> =
             indices.iter().map(|&i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<20>(&leaves);
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
 
         for &idx in &indices {
             let smt_proof = smt.generate_membership_proof(idx as u64);
@@ -1156,7 +1487,7 @@ mod tests {
 
     #[test]
     fn test_sparse_proof_full_root() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
             (0..8).map(|i| (i, Fp::random(rng))).collect();
@@ -1178,7 +1509,7 @@ mod tests {
 
     #[test]
     fn test_sparse_proof_compact_root() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
             (0..8).map(|i| (i, Fp::random(rng))).collect();
@@ -1207,7 +1538,7 @@ mod tests {
 
     #[test]
     fn test_scale_1k_leaves() {
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
             (0..1000).map(|i| (i, Fp::random(rng))).collect();
@@ -1239,7 +1570,7 @@ mod tests {
     #[test]
     fn test_scale_height_53() {
         let mut rng = OsRng;
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
 
         // Create 10,000 leaves with random u64 indices in the 2^53 space
@@ -1337,7 +1668,7 @@ mod tests {
     fn test_nonexistent_proof_single_mismatch() {
         // Tree with one leaf at index 5: proof for index 3 should
         // return the empty leaf with the correct sibling hashes.
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> = [(5, Fp::random(rng))].into_iter().collect();
@@ -1372,7 +1703,7 @@ mod tests {
     fn test_nonexistent_proof_double_mismatch() {
         // Tree with leaves at indices 2 and 7: proof for index 4
         // should work correctly.
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> = [(2, Fp::random(rng)), (7, Fp::random(rng))]
@@ -1414,7 +1745,7 @@ mod tests {
     fn test_nonexistent_proof_multi_descend_into_zero() {
         // Tree with leaves clustered on the left side (indices 0..8),
         // probing an index on the empty right side.
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
         let leaves: BTreeMap<u32, Fp> =
@@ -1473,7 +1804,7 @@ mod tests {
         // SparseMerkleTree field-by-field.
         let rng = OsRng;
         let empty_leaf = [0u8; 64];
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_val = Fp::from_uniform_bytes(&empty_leaf);
 
         // Height 3, 3 leaves
@@ -1552,7 +1883,7 @@ mod tests {
         // original SMT and produce the correct full root.
         let rng = OsRng;
         let empty_leaf = [0u8; 64];
-        let poseidon = Poseidon::<Fp, 2>::new();
+        let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_val = Fp::from_uniform_bytes(&empty_leaf);
 
         let indices = [0u32, 5, 13, 100, 500, 1000];
@@ -1615,7 +1946,7 @@ mod tests {
         use std::time::Instant;
 
         let rng = OsRng;
-        let hasher = Poseidon::<Fp, 2>::new();
+        let hasher = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
 
         // Height 10, 50 leaves
@@ -1630,7 +1961,7 @@ mod tests {
             let existing_indices: Vec<u64> = leaves.keys().map(|&k| k as u64).collect();
             let non_existent: Vec<u64> = (50..150).map(|i| i as u64).collect();
 
-            let iters = 100;
+            let iters = 10;
 
             let start = Instant::now();
             for _ in 0..iters {
@@ -1687,7 +2018,7 @@ mod tests {
             let existing_indices: Vec<u64> = leaves.keys().take(10).map(|&k| k as u64).collect();
             let non_existent: Vec<u64> = (1..11).map(|i| i as u64).collect();
 
-            let iters = 50;
+            let iters = 5;
 
             let start = Instant::now();
             for _ in 0..iters {
@@ -1731,5 +2062,171 @@ mod tests {
                 existing_sparse, nonexist_sparse
             );
         }
+    }
+
+    // ---- Serialization tests ----
+
+    /// Helper: build a CompressedSMT from u64-indexed leaves.
+    fn create_csmt<const N: usize>(
+        leaves: &BTreeMap<u64, Fp>,
+    ) -> CompressedSMT<Fp, TestHasher, N> {
+        let hasher = Poseidon2::<Fp, 2>::new();
+        let empty_leaf = [0u8; 64];
+        CompressedSMT::new(leaves, &hasher, &empty_leaf).unwrap()
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_empty() {
+        let leaves: BTreeMap<u64, Fp> = BTreeMap::new();
+        let csmt = create_csmt::<8>(&leaves);
+
+        let mut buf = Vec::new();
+        csmt.serialize_to(&mut buf).unwrap();
+
+        let restored =
+            CompressedSMT::<Fp, TestHasher, 8>::deserialize_from(&mut &buf[..]).unwrap();
+        assert_eq!(csmt.root(), restored.root());
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_single_leaf() {
+        let mut leaves = BTreeMap::new();
+        leaves.insert(5u64, Fp::from(42u64));
+        let csmt = create_csmt::<10>(&leaves);
+
+        let mut buf = Vec::new();
+        csmt.serialize_to(&mut buf).unwrap();
+
+        let restored =
+            CompressedSMT::<Fp, TestHasher, 10>::deserialize_from(&mut &buf[..]).unwrap();
+        assert_eq!(csmt.root(), restored.root());
+
+        // Verify proofs match
+        let proof_orig = csmt.generate_membership_proof(5);
+        let proof_rest = restored.generate_membership_proof(5);
+        assert_eq!(proof_orig.path, proof_rest.path);
+        assert_eq!(proof_orig.direction_bits, proof_rest.direction_bits);
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_two_leaves() {
+        let mut leaves = BTreeMap::new();
+        leaves.insert(0u64, Fp::from(100u64));
+        leaves.insert(3u64, Fp::from(200u64));
+        let csmt = create_csmt::<8>(&leaves);
+
+        let mut buf = Vec::new();
+        csmt.serialize_to(&mut buf).unwrap();
+
+        let restored =
+            CompressedSMT::<Fp, TestHasher, 8>::deserialize_from(&mut &buf[..]).unwrap();
+        assert_eq!(csmt.root(), restored.root());
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_many_leaves() {
+        let rng = OsRng;
+        let leaves: BTreeMap<u64, Fp> =
+            (0..500).map(|i| (i * 7, Fp::random(rng))).collect();
+        let csmt = create_csmt::<20>(&leaves);
+
+        let mut buf = Vec::new();
+        csmt.serialize_to(&mut buf).unwrap();
+
+        let restored =
+            CompressedSMT::<Fp, TestHasher, 20>::deserialize_from(&mut &buf[..]).unwrap();
+        assert_eq!(csmt.root(), restored.root());
+
+        // Verify several proofs
+        for &idx in leaves.keys().take(10) {
+            let proof_orig = csmt.generate_membership_proof(idx);
+            let proof_rest = restored.generate_membership_proof(idx);
+            assert_eq!(proof_orig.path, proof_rest.path);
+        }
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_sparse_proofs() {
+        let rng = OsRng;
+        let leaves: BTreeMap<u64, Fp> =
+            (0..100).map(|i| (i * 3, Fp::random(rng))).collect();
+        let csmt = create_csmt::<15>(&leaves);
+
+        let mut buf = Vec::new();
+        csmt.serialize_to(&mut buf).unwrap();
+
+        let restored =
+            CompressedSMT::<Fp, TestHasher, 15>::deserialize_from(&mut &buf[..]).unwrap();
+
+        // Verify sparse proofs on non-existent indices
+        for idx in [1u64, 2, 4, 7, 999] {
+            let sparse_orig = csmt.generate_sparse_membership_proof(idx);
+            let sparse_rest = restored.generate_sparse_membership_proof(idx);
+            assert_eq!(sparse_orig.entries.len(), sparse_rest.entries.len());
+            for (a, b) in sparse_orig.entries.iter().zip(sparse_rest.entries.iter()) {
+                assert_eq!(a.sibling, b.sibling);
+                assert_eq!(a.direction_bit, b.direction_bit);
+                assert_eq!(a.level, b.level);
+            }
+        }
+    }
+
+    #[test]
+    fn test_deserialize_corrupt_magic() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"BADMAGIC");
+        buf.extend_from_slice(&8u64.to_le_bytes());
+        // Doesn't matter what follows — should fail on magic check
+
+        let result =
+            CompressedSMT::<Fp, TestHasher, 8>::deserialize_from(&mut &buf[..]);
+        match result {
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                assert!(err_msg.contains("magic"), "Error should mention magic: {}", err_msg);
+            }
+            Ok(_) => panic!("Expected error for corrupt magic"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_height_mismatch() {
+        // Build a tree with height 8 and serialize it
+        let leaves: BTreeMap<u64, Fp> = BTreeMap::new();
+        let csmt = create_csmt::<8>(&leaves);
+
+        let mut buf = Vec::new();
+        csmt.serialize_to(&mut buf).unwrap();
+
+        // Try to deserialize as height 10 — should fail
+        let result =
+            CompressedSMT::<Fp, TestHasher, 10>::deserialize_from(&mut &buf[..]);
+        match result {
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                assert!(
+                    err_msg.contains("height mismatch") || err_msg.contains("mismatch"),
+                    "Error should mention height mismatch: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected error for height mismatch"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_truncated_data() {
+        let mut leaves = BTreeMap::new();
+        leaves.insert(1u64, Fp::from(42u64));
+        let csmt = create_csmt::<8>(&leaves);
+
+        let mut buf = Vec::new();
+        csmt.serialize_to(&mut buf).unwrap();
+
+        // Truncate the buffer mid-way
+        let truncated = &buf[..buf.len() / 2];
+        let result =
+            CompressedSMT::<Fp, TestHasher, 8>::deserialize_from(&mut &truncated[..]);
+        assert!(result.is_err());
     }
 }
