@@ -35,7 +35,7 @@
 //! the nodes. Then the merkle proof path `e-b-a` from leaf `e` to root `a` is
 //! stored as `[(d,e), (b,c)]`
 
-use crate::poseidon::FieldHasher;
+use crate::poseidon2::FieldHasher;
 use anyhow::{Error, Result};
 use ff::{FromUniformBytes, PrimeField};
 use std::time::Instant;
@@ -132,129 +132,6 @@ impl<F: PrimeField, H: FieldHasher<F, 2>, const N: usize> Path<F, H, N> {
         }
 
         Ok(index)
-    }
-}
-
-/// A single non-zero sibling entry in a sparse path.
-#[derive(Clone, Debug)]
-pub struct SparsePathEntry<F: PrimeField> {
-    /// The sibling hash at this level.
-    pub sibling: F,
-    /// Direction bit: false = left child, true = right child.
-    pub direction_bit: bool,
-    /// The level in the tree (0 = leaf level).
-    pub level: usize,
-}
-
-/// Variable-length Merkle path containing only non-zero siblings.
-///
-/// Instead of storing all N levels (most of which have empty-hash siblings
-/// in a sparse tree), this stores only the K levels where the sibling differs
-/// from the precomputed empty hash. This enables a much smaller circuit.
-pub struct SparsePath<F: PrimeField, H: FieldHasher<F, 2>> {
-    /// The non-zero sibling entries, ordered from leaf to root.
-    pub entries: Vec<SparsePathEntry<F>>,
-    /// The height of the tree (number of levels).
-    pub tree_height: usize,
-    /// Precomputed empty hashes for each level.
-    pub empty_hashes: Vec<F>,
-    /// Phantom data for the hasher type.
-    pub marker: PhantomData<H>,
-}
-
-// Manual Clone impl to avoid requiring H: Clone (H is only in PhantomData).
-impl<F: PrimeField, H: FieldHasher<F, 2>> Clone for SparsePath<F, H> {
-    fn clone(&self) -> Self {
-        SparsePath {
-            entries: self.entries.clone(),
-            tree_height: self.tree_height,
-            empty_hashes: self.empty_hashes.clone(),
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<F: PrimeField, H: FieldHasher<F, 2>> SparsePath<F, H> {
-    /// Hash through only the K non-zero entries to produce the compact root.
-    /// This matches exactly what the circuit computes.
-    pub fn calculate_compact_root(&self, leaf: &F, hasher: &H) -> Result<F, Error> {
-        let mut prev = *leaf;
-        for entry in &self.entries {
-            let (left, right) = if entry.direction_bit {
-                (entry.sibling, prev) // we're right child, sibling is left
-            } else {
-                (prev, entry.sibling) // we're left child, sibling is right
-            };
-            prev = hasher.hash([left, right])?;
-        }
-        Ok(prev)
-    }
-
-    /// Hash through all tree_height levels, using empty_hashes for gap levels.
-    /// Returns the standard SMT root.
-    pub fn calculate_full_root(
-        &self,
-        leaf: &F,
-        hasher: &H,
-        leaf_index: u64,
-    ) -> Result<F, Error> {
-        let mut prev = *leaf;
-        let mut entry_idx = 0;
-        for level in 0..self.tree_height {
-            let direction_bit = (leaf_index >> level) & 1 == 1;
-            let sibling = if entry_idx < self.entries.len()
-                && self.entries[entry_idx].level == level
-            {
-                let s = self.entries[entry_idx].sibling;
-                entry_idx += 1;
-                s
-            } else {
-                self.empty_hashes[level]
-            };
-            let (left, right) = if direction_bit {
-                (sibling, prev)
-            } else {
-                (prev, sibling)
-            };
-            prev = hasher.hash([left, right])?;
-        }
-        Ok(prev)
-    }
-
-    /// Verify that the compact root chains through gap levels to produce
-    /// the expected standard root.
-    pub fn verify_against_root(
-        &self,
-        leaf: &F,
-        hasher: &H,
-        leaf_index: u64,
-        expected_root: &F,
-    ) -> Result<bool, Error> {
-        let full_root = self.calculate_full_root(leaf, hasher, leaf_index)?;
-        Ok(full_root == *expected_root)
-    }
-
-    /// Convert to fixed-size arrays for the circuit.
-    /// Returns (siblings, direction_bits, is_active) each of length MAX_K,
-    /// padded with zeros for inactive slots.
-    pub fn to_padded_arrays<const MAX_K: usize>(
-        &self,
-    ) -> ([F; MAX_K], [bool; MAX_K], [bool; MAX_K]) {
-        assert!(
-            self.entries.len() <= MAX_K,
-            "SparsePath has {} entries but MAX_K is {}",
-            self.entries.len(),
-            MAX_K,
-        );
-        let mut siblings = [F::ZERO; MAX_K];
-        let mut direction_bits = [false; MAX_K];
-        let mut is_active = [false; MAX_K];
-        for (i, entry) in self.entries.iter().enumerate() {
-            siblings[i] = entry.sibling;
-            direction_bits[i] = entry.direction_bit;
-            is_active[i] = true;
-        }
-        (siblings, direction_bits, is_active)
     }
 }
 
@@ -425,47 +302,6 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
             marker: PhantomData,
         }
     }
-
-    /// Generate a sparse membership proof containing only non-zero sibling levels.
-    ///
-    /// This walks from the leaf to the root and only includes levels where
-    /// the sibling hash differs from the precomputed empty hash at that level.
-    /// The resulting `SparsePath` has K entries where K << N for sparse trees.
-    pub fn generate_sparse_membership_proof(&self, index: u64) -> SparsePath<F, H> {
-        let tree_index = convert_index_to_last_level(index, N);
-        let mut entries = Vec::new();
-
-        let mut current_node = tree_index;
-        let mut level = 0;
-        while !is_root(current_node) {
-            let sibling_node = sibling(current_node).unwrap();
-            let empty_hash = &self.empty_hashes[level];
-            let sibling_val = self
-                .tree
-                .get(&sibling_node)
-                .cloned()
-                .unwrap_or(*empty_hash);
-
-            // Only include levels where sibling differs from empty hash
-            if sibling_val != *empty_hash {
-                entries.push(SparsePathEntry {
-                    sibling: sibling_val,
-                    direction_bit: !is_left_child(current_node),
-                    level,
-                });
-            }
-
-            current_node = parent(current_node).unwrap();
-            level += 1;
-        }
-
-        SparsePath {
-            entries,
-            tree_height: N,
-            empty_hashes: self.empty_hashes.to_vec(),
-            marker: PhantomData,
-        }
-    }
 }
 
 /// A function to generate empty hashes with a given `default_leaf`.
@@ -555,7 +391,7 @@ fn parent(index: u64) -> Option<u64> {
 #[cfg(test)]
 mod test {
     use super::{gen_empty_hashes, SparseMerkleTree};
-    use crate::poseidon::FieldHasher;
+    use crate::poseidon2::FieldHasher;
     use crate::poseidon2::Poseidon2;
     use ff::{Field, FromUniformBytes, PrimeField};
     use pasta_curves::Fp;
@@ -651,132 +487,5 @@ mod test {
         let desired_res = Fp::from(index);
 
         assert_eq!(res, desired_res);
-    }
-
-    // ========== Sparse Path Tests ==========
-
-    #[test]
-    fn test_sparse_proof_generation() {
-        let poseidon = Poseidon2::<Fp, 2>::new();
-        let default_leaf = [0u8; 64];
-        let rng = OsRng;
-        let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
-        const HEIGHT: usize = 20;
-        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
-            poseidon.clone(),
-            &leaves,
-            &default_leaf,
-        );
-
-        let sparse_proof = smt.generate_sparse_membership_proof(0);
-
-        // K should be much less than N for a sparse tree
-        println!(
-            "Sparse proof entries: {} out of {} levels",
-            sparse_proof.entries.len(),
-            HEIGHT
-        );
-        assert!(sparse_proof.entries.len() < HEIGHT);
-        assert!(!sparse_proof.entries.is_empty());
-
-        // Entries should be in ascending level order
-        for i in 1..sparse_proof.entries.len() {
-            assert!(sparse_proof.entries[i].level > sparse_proof.entries[i - 1].level);
-        }
-    }
-
-    #[test]
-    fn test_compact_root_matches() {
-        let poseidon = Poseidon2::<Fp, 2>::new();
-        let default_leaf = [0u8; 64];
-        let rng = OsRng;
-        let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
-        const HEIGHT: usize = 20;
-        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
-            poseidon.clone(),
-            &leaves,
-            &default_leaf,
-        );
-
-        let sparse_proof = smt.generate_sparse_membership_proof(0);
-        let compact_root = sparse_proof
-            .calculate_compact_root(&leaves[0], &poseidon)
-            .unwrap();
-
-        // Compute the same thing manually
-        let mut prev = leaves[0];
-        for entry in &sparse_proof.entries {
-            let (left, right) = if entry.direction_bit {
-                (entry.sibling, prev)
-            } else {
-                (prev, entry.sibling)
-            };
-            prev = poseidon.hash([left, right]).unwrap();
-        }
-        assert_eq!(compact_root, prev);
-    }
-
-    #[test]
-    fn test_full_root_matches_standard() {
-        let poseidon = Poseidon2::<Fp, 2>::new();
-        let default_leaf = [0u8; 64];
-        let rng = OsRng;
-        let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
-        const HEIGHT: usize = 20;
-        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
-            poseidon.clone(),
-            &leaves,
-            &default_leaf,
-        );
-
-        for index in 0..3u64 {
-            let sparse_proof = smt.generate_sparse_membership_proof(index);
-            let full_root = sparse_proof
-                .calculate_full_root(&leaves[index as usize], &poseidon, index)
-                .unwrap();
-            assert_eq!(
-                full_root,
-                smt.root(),
-                "Full root mismatch for leaf index {}",
-                index
-            );
-        }
-    }
-
-    #[test]
-    fn test_sparse_roundtrip() {
-        let poseidon = Poseidon2::<Fp, 2>::new();
-        let default_leaf = [0u8; 64];
-        let rng = OsRng;
-        let leaves = [Fp::random(rng), Fp::random(rng), Fp::random(rng)];
-        const HEIGHT: usize = 20;
-        let smt = create_merkle_tree::<Fp, Poseidon2<Fp, 2>, HEIGHT>(
-            poseidon.clone(),
-            &leaves,
-            &default_leaf,
-        );
-
-        for index in 0..3u64 {
-            let sparse_proof = smt.generate_sparse_membership_proof(index);
-
-            // verify_against_root should pass
-            let result = sparse_proof
-                .verify_against_root(&leaves[index as usize], &poseidon, index, &smt.root())
-                .unwrap();
-            assert!(result, "Sparse roundtrip failed for leaf index {}", index);
-
-            // Verify that to_padded_arrays works
-            let (siblings, dir_bits, is_active) = sparse_proof.to_padded_arrays::<32>();
-            let k = sparse_proof.entries.len();
-            for i in 0..k {
-                assert!(is_active[i]);
-                assert_eq!(siblings[i], sparse_proof.entries[i].sibling);
-                assert_eq!(dir_bits[i], sparse_proof.entries[i].direction_bit);
-            }
-            for i in k..32 {
-                assert!(!is_active[i]);
-                assert_eq!(siblings[i], Fp::ZERO);
-            }
-        }
     }
 }

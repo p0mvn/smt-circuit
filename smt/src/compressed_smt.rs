@@ -5,13 +5,13 @@
 //! of materializing every internal node in a `BTreeMap`.
 //!
 //! For 51.7M leaves at height 53, this reduces memory from ~80 GB to ~6 GB
-//! while producing identical [`Path`] and [`SparsePath`] proofs compatible
-//! with the existing circuit chips (`PathChip`, `SparsePathChip`).
+//! while producing identical [`Path`] proofs compatible with the existing
+//! circuit chip (`PathChip`).
 //!
 //! Construction uses rayon for multi-core parallelism on large subtrees.
 
-use crate::poseidon::FieldHasher;
-use crate::smt::{gen_empty_hashes, Path, SparsePath, SparsePathEntry};
+use crate::poseidon2::FieldHasher;
+use crate::smt::{gen_empty_hashes, Path};
 use anyhow::Result;
 use ff::{FromUniformBytes, PrimeField};
 use std::collections::BTreeMap;
@@ -638,151 +638,6 @@ fn fill_path<F: PrimeField, H: FieldHasher<F, 2>>(
 }
 
 // ============================================================
-// Sparse proof helper
-// ============================================================
-
-/// Collect non-empty sibling entries for a sparse membership proof.
-///
-/// Traverses the compressed tree, adding a `SparsePathEntry` only when
-/// the sibling hash differs from the precomputed empty hash at that level.
-/// Entries are naturally produced in ascending level order (leaf -> root).
-/// For non-existent leaves, entries are produced for the actual non-empty
-/// siblings along the path, matching [`SparseMerkleTree`] behavior.
-fn collect_sparse_entries<F: PrimeField, H: FieldHasher<F, 2>>(
-    node: &CompressedNode<F>,
-    target_index: u64,
-    level: usize,
-    hasher: &H,
-    empty_hashes: &[F],
-    entries: &mut Vec<SparsePathEntry<F>>,
-) {
-    match node {
-        CompressedNode::Zero => {
-            // Non-existent leaf in an all-empty subtree: no non-empty siblings.
-        }
-        CompressedNode::Single {
-            leaf_index,
-            leaf_value,
-            ..
-        } => {
-            if *leaf_index == target_index {
-                // All siblings within a Single node are empty hashes — no entries to add.
-            } else {
-                // Non-existent leaf: existing leaf is a non-empty sibling
-                // at the divergence level.
-                let xor = target_index ^ *leaf_index;
-                let div_level = (64 - xor.leading_zeros()) as usize;
-                let sibling_hash = compute_single_hash(
-                    (*leaf_index, *leaf_value),
-                    div_level - 1,
-                    hasher,
-                    empty_hashes,
-                );
-                let bit = (target_index >> (div_level - 1)) & 1;
-                entries.push(SparsePathEntry {
-                    sibling: sibling_hash,
-                    direction_bit: bit == 1,
-                    level: div_level - 1,
-                });
-            }
-        }
-        CompressedNode::Double { leaf_a, leaf_b, .. } => {
-            if leaf_a.0 == target_index || leaf_b.0 == target_index {
-                // Target matches one leaf; the other is a sibling at divergence.
-                let other = if leaf_a.0 == target_index {
-                    leaf_b
-                } else {
-                    leaf_a
-                };
-                let xor = target_index ^ other.0;
-                let div_level = (64 - xor.leading_zeros()) as usize;
-                let sibling_hash =
-                    compute_single_hash(*other, div_level - 1, hasher, empty_hashes);
-                let bit = (target_index >> (div_level - 1)) & 1;
-                entries.push(SparsePathEntry {
-                    sibling: sibling_hash,
-                    direction_bit: bit == 1,
-                    level: div_level - 1,
-                });
-            } else {
-                // Non-existent target: both leaves appear as siblings.
-                let xor_a = target_index ^ leaf_a.0;
-                let xor_b = target_index ^ leaf_b.0;
-                let div_a = (64 - xor_a.leading_zeros()) as usize;
-                let div_b = (64 - xor_b.leading_zeros()) as usize;
-
-                if div_a == div_b {
-                    // Both leaves diverge at the same level — combined sibling.
-                    let combined = compute_double_hash(
-                        *leaf_a, *leaf_b, div_a - 1, hasher, empty_hashes,
-                    );
-                    let bit = (target_index >> (div_a - 1)) & 1;
-                    entries.push(SparsePathEntry {
-                        sibling: combined,
-                        direction_bit: bit == 1,
-                        level: div_a - 1,
-                    });
-                } else {
-                    // Leaves at different divergence levels — two entries
-                    // pushed in ascending level order.
-                    let (close, far, close_div, far_div) = if div_a < div_b {
-                        (leaf_a, leaf_b, div_a, div_b)
-                    } else {
-                        (leaf_b, leaf_a, div_b, div_a)
-                    };
-                    let close_hash = compute_single_hash(
-                        *close, close_div - 1, hasher, empty_hashes,
-                    );
-                    let close_bit = (target_index >> (close_div - 1)) & 1;
-                    entries.push(SparsePathEntry {
-                        sibling: close_hash,
-                        direction_bit: close_bit == 1,
-                        level: close_div - 1,
-                    });
-                    let far_hash = compute_single_hash(
-                        *far, far_div - 1, hasher, empty_hashes,
-                    );
-                    let far_bit = (target_index >> (far_div - 1)) & 1;
-                    entries.push(SparsePathEntry {
-                        sibling: far_hash,
-                        direction_bit: far_bit == 1,
-                        level: far_div - 1,
-                    });
-                }
-            }
-        }
-        CompressedNode::Multi { left, right, .. } => {
-            let bit = (target_index >> (level - 1)) & 1;
-            let (target_child, sibling_child) = if bit == 0 {
-                (left.as_ref(), right.as_ref())
-            } else {
-                (right.as_ref(), left.as_ref())
-            };
-
-            // Recurse into target child first (produces lower-level entries)
-            collect_sparse_entries(
-                target_child,
-                target_index,
-                level - 1,
-                hasher,
-                empty_hashes,
-                entries,
-            );
-
-            // Add sibling if non-empty
-            let sibling_hash = sibling_child.hash_at_level(level - 1, empty_hashes);
-            if sibling_hash != empty_hashes[level - 1] {
-                entries.push(SparsePathEntry {
-                    sibling: sibling_hash,
-                    direction_bit: bit == 1,
-                    level: level - 1,
-                });
-            }
-        }
-    }
-}
-
-// ============================================================
 // CompressedSMT public struct and API
 // ============================================================
 
@@ -790,8 +645,8 @@ fn collect_sparse_entries<F: PrimeField, H: FieldHasher<F, 2>>(
 ///
 /// A memory-efficient alternative to [`SparseMerkleTree`] that classifies
 /// subtrees by their non-default leaf count instead of storing every
-/// internal node. Produces identical [`Path`] and [`SparsePath`] proofs
-/// compatible with the existing circuit chips.
+/// internal node. Produces identical [`Path`] proofs compatible with
+/// the existing `PathChip` circuit.
 ///
 /// # Type Parameters
 ///
@@ -879,20 +734,6 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
         })
     }
 
-    /// Build from u32-indexed leaves (backward compatibility with `SparseMerkleTree::new`).
-    pub fn new_from_u32(
-        leaves: &BTreeMap<u32, F>,
-        hasher: &H,
-        empty_leaf: &[u8; 64],
-    ) -> Result<Self>
-    where
-        H: Sync,
-    {
-        let leaves64: BTreeMap<u64, F> =
-            leaves.iter().map(|(&k, &v)| (k as u64, v)).collect();
-        Self::new(&leaves64, hasher, empty_leaf)
-    }
-
     /// Returns the Merkle tree root hash.
     ///
     /// For an empty tree, returns `empty_hashes[N-1]` to match
@@ -933,36 +774,6 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
         Path {
             path,
             direction_bits,
-            marker: PhantomData,
-        }
-    }
-
-    /// Generate a sparse membership proof (only non-empty sibling levels).
-    ///
-    /// Returns a [`SparsePath`] compatible with `SparsePathChip`.
-    /// The proof has K entries where K << N for sparse trees.
-    ///
-    /// For non-existent indices, the proof contains entries for the
-    /// actual non-empty siblings along the path, matching
-    /// [`SparseMerkleTree::generate_sparse_membership_proof`] behavior.
-    pub fn generate_sparse_membership_proof(&self, index: u64) -> SparsePath<F, H> {
-        let hasher = H::hasher();
-        let mut entries = Vec::new();
-
-        collect_sparse_entries(
-            &self.root,
-            index,
-            N,
-            &hasher,
-            &self.empty_hashes,
-            &mut entries,
-        );
-
-        // Entries are already in ascending level order due to recursion-first traversal.
-        SparsePath {
-            entries,
-            tree_height: N,
-            empty_hashes: self.empty_hashes.to_vec(),
             marker: PhantomData,
         }
     }
@@ -1246,15 +1057,17 @@ mod tests {
 
     /// Helper: create both the original SMT and compressed SMT from the same leaves.
     fn create_both<const N: usize>(
-        leaves: &BTreeMap<u32, Fp>,
+        leaves: &BTreeMap<u64, Fp>,
     ) -> (
         SparseMerkleTree<Fp, TestHasher, N>,
         CompressedSMT<Fp, TestHasher, N>,
     ) {
         let hasher = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
-        let smt = SparseMerkleTree::new(leaves, &hasher, &empty_leaf).unwrap();
-        let csmt = CompressedSMT::new_from_u32(leaves, &hasher, &empty_leaf).unwrap();
+        let leaves32: BTreeMap<u32, Fp> =
+            leaves.iter().map(|(&k, &v)| (k as u32, v)).collect();
+        let smt = SparseMerkleTree::new(&leaves32, &hasher, &empty_leaf).unwrap();
+        let csmt = CompressedSMT::new(leaves, &hasher, &empty_leaf).unwrap();
         (smt, csmt)
     }
 
@@ -1263,7 +1076,7 @@ mod tests {
     #[test]
     fn test_root_matches_height_3() {
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
+        let leaves: BTreeMap<u64, Fp> =
             (0..3).map(|i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<3>(&leaves);
         assert_eq!(smt.root(), csmt.root());
@@ -1272,7 +1085,7 @@ mod tests {
     #[test]
     fn test_root_matches_height_10() {
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
+        let leaves: BTreeMap<u64, Fp> =
             (0..50).map(|i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<10>(&leaves);
         assert_eq!(smt.root(), csmt.root());
@@ -1281,8 +1094,8 @@ mod tests {
     #[test]
     fn test_root_matches_sparse_leaves() {
         let rng = OsRng;
-        let indices = [0u32, 5, 13, 100, 500, 1000];
-        let leaves: BTreeMap<u32, Fp> =
+        let indices = [0u64, 5, 13, 100, 500, 1000];
+        let leaves: BTreeMap<u64, Fp> =
             indices.iter().map(|&i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<20>(&leaves);
         assert_eq!(smt.root(), csmt.root());
@@ -1291,7 +1104,7 @@ mod tests {
     #[test]
     fn test_root_single_leaf() {
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> = [(0, Fp::random(rng))].into_iter().collect();
+        let leaves: BTreeMap<u64, Fp> = [(0, Fp::random(rng))].into_iter().collect();
         let (smt, csmt) = create_both::<10>(&leaves);
         assert_eq!(smt.root(), csmt.root());
     }
@@ -1299,7 +1112,7 @@ mod tests {
     #[test]
     fn test_root_two_leaves() {
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> = [(0, Fp::random(rng)), (1, Fp::random(rng))]
+        let leaves: BTreeMap<u64, Fp> = [(0, Fp::random(rng)), (1, Fp::random(rng))]
             .into_iter()
             .collect();
         let (smt, csmt) = create_both::<10>(&leaves);
@@ -1309,7 +1122,7 @@ mod tests {
     #[test]
     fn test_root_two_leaves_wide_separation() {
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
+        let leaves: BTreeMap<u64, Fp> =
             [(0, Fp::random(rng)), (1023, Fp::random(rng))]
                 .into_iter()
                 .collect();
@@ -1319,7 +1132,7 @@ mod tests {
 
     #[test]
     fn test_root_empty_tree() {
-        let leaves: BTreeMap<u32, Fp> = BTreeMap::new();
+        let leaves: BTreeMap<u64, Fp> = BTreeMap::new();
         let (smt, csmt) = create_both::<10>(&leaves);
         assert_eq!(smt.root(), csmt.root());
     }
@@ -1372,13 +1185,13 @@ mod tests {
     #[test]
     fn test_dense_proof_matches_original() {
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
+        let leaves: BTreeMap<u64, Fp> =
             (0..5).map(|i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<10>(&leaves);
 
         for &idx in leaves.keys() {
-            let smt_proof = smt.generate_membership_proof(idx as u64);
-            let csmt_proof = csmt.generate_membership_proof(idx as u64);
+            let smt_proof = smt.generate_membership_proof(idx);
+            let csmt_proof = csmt.generate_membership_proof(idx);
 
             for level in 0..10 {
                 assert_eq!(
@@ -1399,12 +1212,12 @@ mod tests {
     fn test_dense_proof_membership_check() {
         let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
+        let leaves: BTreeMap<u64, Fp> =
             (0..8).map(|i| (i, Fp::random(rng))).collect();
         let (_, csmt) = create_both::<10>(&leaves);
 
         for (&idx, &val) in &leaves {
-            let proof = csmt.generate_membership_proof(idx as u64);
+            let proof = csmt.generate_membership_proof(idx);
             let ok = proof
                 .check_membership(&csmt.root(), &val, &poseidon)
                 .unwrap();
@@ -1415,15 +1228,15 @@ mod tests {
     #[test]
     fn test_dense_proof_sparse_leaves() {
         let rng = OsRng;
-        let indices = [0u32, 5, 13, 100, 500, 1000];
-        let leaves: BTreeMap<u32, Fp> =
+        let indices = [0u64, 5, 13, 100, 500, 1000];
+        let leaves: BTreeMap<u64, Fp> =
             indices.iter().map(|&i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<20>(&leaves);
         let poseidon = Poseidon2::<Fp, 2>::new();
 
         for &idx in &indices {
-            let smt_proof = smt.generate_membership_proof(idx as u64);
-            let csmt_proof = csmt.generate_membership_proof(idx as u64);
+            let smt_proof = smt.generate_membership_proof(idx);
+            let csmt_proof = csmt.generate_membership_proof(idx);
 
             for level in 0..20 {
                 assert_eq!(
@@ -1440,130 +1253,25 @@ mod tests {
         }
     }
 
-    // ---- Sparse proof tests ----
-
-    #[test]
-    fn test_sparse_proof_matches_original() {
-        let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
-            (0..5).map(|i| (i, Fp::random(rng))).collect();
-        let (smt, csmt) = create_both::<20>(&leaves);
-
-        for &idx in leaves.keys() {
-            let smt_sparse = smt.generate_sparse_membership_proof(idx as u64);
-            let csmt_sparse = csmt.generate_sparse_membership_proof(idx as u64);
-
-            assert_eq!(
-                smt_sparse.entries.len(),
-                csmt_sparse.entries.len(),
-                "entry count mismatch for leaf {}",
-                idx
-            );
-
-            for (i, (s, c)) in smt_sparse
-                .entries
-                .iter()
-                .zip(csmt_sparse.entries.iter())
-                .enumerate()
-            {
-                assert_eq!(
-                    s.sibling, c.sibling,
-                    "sibling mismatch at entry {} for leaf {}",
-                    i, idx
-                );
-                assert_eq!(
-                    s.direction_bit, c.direction_bit,
-                    "direction_bit mismatch at entry {} for leaf {}",
-                    i, idx
-                );
-                assert_eq!(
-                    s.level, c.level,
-                    "level mismatch at entry {} for leaf {}",
-                    i, idx
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_sparse_proof_full_root() {
-        let poseidon = Poseidon2::<Fp, 2>::new();
-        let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
-            (0..8).map(|i| (i, Fp::random(rng))).collect();
-        let (_, csmt) = create_both::<20>(&leaves);
-
-        for (&idx, &val) in &leaves {
-            let sparse = csmt.generate_sparse_membership_proof(idx as u64);
-            let full_root = sparse
-                .calculate_full_root(&val, &poseidon, idx as u64)
-                .unwrap();
-            assert_eq!(
-                full_root,
-                csmt.root(),
-                "full root mismatch for leaf {}",
-                idx
-            );
-        }
-    }
-
-    #[test]
-    fn test_sparse_proof_compact_root() {
-        let poseidon = Poseidon2::<Fp, 2>::new();
-        let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
-            (0..8).map(|i| (i, Fp::random(rng))).collect();
-        let (smt, csmt) = create_both::<20>(&leaves);
-
-        for (&idx, &val) in &leaves {
-            let smt_sparse = smt.generate_sparse_membership_proof(idx as u64);
-            let csmt_sparse = csmt.generate_sparse_membership_proof(idx as u64);
-
-            let smt_compact = smt_sparse
-                .calculate_compact_root(&val, &poseidon)
-                .unwrap();
-            let csmt_compact = csmt_sparse
-                .calculate_compact_root(&val, &poseidon)
-                .unwrap();
-
-            assert_eq!(
-                smt_compact, csmt_compact,
-                "compact root mismatch for leaf {}",
-                idx
-            );
-        }
-    }
-
     // ---- Scale tests ----
 
     #[test]
     fn test_scale_1k_leaves() {
         let poseidon = Poseidon2::<Fp, 2>::new();
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
+        let leaves: BTreeMap<u64, Fp> =
             (0..1000).map(|i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<20>(&leaves);
 
         assert_eq!(smt.root(), csmt.root(), "roots should match for 1000 leaves");
 
         // Check a sample of proofs
-        for idx in [0u32, 42, 500, 999] {
-            let proof = csmt.generate_membership_proof(idx as u64);
+        for idx in [0u64, 42, 500, 999] {
+            let proof = csmt.generate_membership_proof(idx);
             let ok = proof
                 .check_membership(&csmt.root(), &leaves[&idx], &poseidon)
                 .unwrap();
             assert!(ok, "membership check failed for leaf {}", idx);
-
-            let sparse = csmt.generate_sparse_membership_proof(idx as u64);
-            let full_root = sparse
-                .calculate_full_root(&leaves[&idx], &poseidon, idx as u64)
-                .unwrap();
-            assert_eq!(
-                full_root,
-                csmt.root(),
-                "sparse full root mismatch for leaf {}",
-                idx
-            );
         }
     }
 
@@ -1599,17 +1307,6 @@ mod tests {
                 .check_membership(&csmt.root(), &leaves[&idx], &poseidon)
                 .unwrap();
             assert!(ok, "membership check failed for leaf {}", idx);
-
-            let sparse = csmt.generate_sparse_membership_proof(idx);
-            let full_root = sparse
-                .calculate_full_root(&leaves[&idx], &poseidon, idx)
-                .unwrap();
-            assert_eq!(
-                full_root,
-                csmt.root(),
-                "sparse full root mismatch for leaf {}",
-                idx
-            );
         }
     }
 
@@ -1626,7 +1323,7 @@ mod tests {
         // different value. This is a pre-existing library convention
         // and doesn't affect real use (exclusion proofs require at
         // least one leaf in the tree).
-        let leaves: BTreeMap<u32, Fp> = BTreeMap::new();
+        let leaves: BTreeMap<u64, Fp> = BTreeMap::new();
         let (smt, csmt) = create_both::<10>(&leaves);
 
         // Roots should match between the two implementations
@@ -1650,18 +1347,6 @@ mod tests {
                 );
             }
         }
-
-        // Also verify sparse proofs match
-        for idx in [0u64, 1, 512, 1023] {
-            let csmt_sparse = csmt.generate_sparse_membership_proof(idx);
-            let smt_sparse = smt.generate_sparse_membership_proof(idx);
-            assert_eq!(
-                smt_sparse.entries.len(),
-                csmt_sparse.entries.len(),
-                "sparse entry count mismatch for index {} in empty tree",
-                idx
-            );
-        }
     }
 
     #[test]
@@ -1671,7 +1356,7 @@ mod tests {
         let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> = [(5, Fp::random(rng))].into_iter().collect();
+        let leaves: BTreeMap<u64, Fp> = [(5, Fp::random(rng))].into_iter().collect();
         let (smt, csmt) = create_both::<10>(&leaves);
         let empty_val = Fp::from_uniform_bytes(&empty_leaf);
 
@@ -1706,7 +1391,7 @@ mod tests {
         let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> = [(2, Fp::random(rng)), (7, Fp::random(rng))]
+        let leaves: BTreeMap<u64, Fp> = [(2, Fp::random(rng)), (7, Fp::random(rng))]
             .into_iter()
             .collect();
         let (smt, csmt) = create_both::<10>(&leaves);
@@ -1748,7 +1433,7 @@ mod tests {
         let poseidon = Poseidon2::<Fp, 2>::new();
         let empty_leaf = [0u8; 64];
         let rng = OsRng;
-        let leaves: BTreeMap<u32, Fp> =
+        let leaves: BTreeMap<u64, Fp> =
             (0..8).map(|i| (i, Fp::random(rng))).collect();
         let (smt, csmt) = create_both::<10>(&leaves);
         let empty_val = Fp::from_uniform_bytes(&empty_leaf);
@@ -1809,7 +1494,7 @@ mod tests {
 
         // Height 3, 3 leaves
         {
-            let leaves: BTreeMap<u32, Fp> =
+            let leaves: BTreeMap<u64, Fp> =
                 [(0, Fp::random(rng)), (3, Fp::random(rng)), (7, Fp::random(rng))]
                     .into_iter()
                     .collect();
@@ -1827,7 +1512,7 @@ mod tests {
 
         // Height 10, 20 random leaves, 10 non-existent probes
         {
-            let leaves: BTreeMap<u32, Fp> =
+            let leaves: BTreeMap<u64, Fp> =
                 (0..20).map(|i| (i * 50, Fp::random(rng))).collect();
             let (smt, csmt) = create_both::<10>(&leaves);
             let non_existent = [1u64, 2, 49, 51, 99, 101, 200, 500, 800, 1023];
@@ -1852,8 +1537,8 @@ mod tests {
 
         // Height 20, sparse leaves
         {
-            let indices = [0u32, 100, 500, 10_000, 100_000, 500_000];
-            let leaves: BTreeMap<u32, Fp> =
+            let indices = [0u64, 100, 500, 10_000, 100_000, 500_000];
+            let leaves: BTreeMap<u64, Fp> =
                 indices.iter().map(|&i| (i, Fp::random(rng))).collect();
             let (smt, csmt) = create_both::<20>(&leaves);
             let non_existent = [1u64, 50, 99, 101, 250, 501, 9999, 10001, 99999, 999_999];
@@ -1877,68 +1562,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_nonexistent_sparse_proof() {
-        // Verify sparse proofs for non-existent indices match the
-        // original SMT and produce the correct full root.
-        let rng = OsRng;
-        let empty_leaf = [0u8; 64];
-        let poseidon = Poseidon2::<Fp, 2>::new();
-        let empty_val = Fp::from_uniform_bytes(&empty_leaf);
-
-        let indices = [0u32, 5, 13, 100, 500, 1000];
-        let leaves: BTreeMap<u32, Fp> =
-            indices.iter().map(|&i| (i, Fp::random(rng))).collect();
-        let (smt, csmt) = create_both::<20>(&leaves);
-
-        let non_existent = [1u64, 4, 6, 12, 14, 50, 101, 501, 999, 1001];
-        for &idx in &non_existent {
-            let smt_sparse = smt.generate_sparse_membership_proof(idx);
-            let csmt_sparse = csmt.generate_sparse_membership_proof(idx);
-
-            assert_eq!(
-                smt_sparse.entries.len(),
-                csmt_sparse.entries.len(),
-                "sparse entry count mismatch for non-existent index {}",
-                idx
-            );
-
-            for (i, (s, c)) in smt_sparse
-                .entries
-                .iter()
-                .zip(csmt_sparse.entries.iter())
-                .enumerate()
-            {
-                assert_eq!(
-                    s.sibling, c.sibling,
-                    "sparse sibling mismatch at entry {} for index {}",
-                    i, idx
-                );
-                assert_eq!(
-                    s.direction_bit, c.direction_bit,
-                    "sparse direction_bit mismatch at entry {} for index {}",
-                    i, idx
-                );
-                assert_eq!(
-                    s.level, c.level,
-                    "sparse level mismatch at entry {} for index {}",
-                    i, idx
-                );
-            }
-
-            // Full root should match
-            let full_root = csmt_sparse
-                .calculate_full_root(&empty_val, &poseidon, idx)
-                .unwrap();
-            assert_eq!(
-                full_root,
-                csmt.root(),
-                "sparse full root mismatch for non-existent index {}",
-                idx
-            );
-        }
-    }
-
     // ---- Benchmarks ----
 
     #[test]
@@ -1951,15 +1574,15 @@ mod tests {
 
         // Height 10, 50 leaves
         {
-            let leaves: BTreeMap<u32, Fp> =
+            let leaves: BTreeMap<u64, Fp> =
                 (0..50).map(|i| (i, Fp::random(rng))).collect();
-            let csmt = CompressedSMT::<Fp, TestHasher, 10>::new_from_u32(
+            let csmt = CompressedSMT::<Fp, TestHasher, 10>::new(
                 &leaves, &hasher, &empty_leaf,
             )
             .unwrap();
 
-            let existing_indices: Vec<u64> = leaves.keys().map(|&k| k as u64).collect();
-            let non_existent: Vec<u64> = (50..150).map(|i| i as u64).collect();
+            let existing_indices: Vec<u64> = leaves.keys().copied().collect();
+            let non_existent: Vec<u64> = (50..150).collect();
 
             let iters = 10;
 
@@ -1979,44 +1602,24 @@ mod tests {
             }
             let nonexist_dense = start.elapsed();
 
-            let start = Instant::now();
-            for _ in 0..iters {
-                for &idx in &existing_indices[..10] {
-                    let _ = csmt.generate_sparse_membership_proof(idx);
-                }
-            }
-            let existing_sparse = start.elapsed();
-
-            let start = Instant::now();
-            for _ in 0..iters {
-                for &idx in &non_existent[..10] {
-                    let _ = csmt.generate_sparse_membership_proof(idx);
-                }
-            }
-            let nonexist_sparse = start.elapsed();
-
             eprintln!("\n--- Height 10 benchmark ({} iters x 10 proofs) ---", iters);
             eprintln!(
                 "  Dense:  existing {:?}  |  non-existent {:?}",
                 existing_dense, nonexist_dense
             );
-            eprintln!(
-                "  Sparse: existing {:?}  |  non-existent {:?}",
-                existing_sparse, nonexist_sparse
-            );
         }
 
         // Height 20, 100 sparse leaves (only CompressedSMT, skips slow old SMT build)
         {
-            let leaves: BTreeMap<u32, Fp> =
+            let leaves: BTreeMap<u64, Fp> =
                 (0..100).map(|i| (i * 100, Fp::random(rng))).collect();
-            let csmt = CompressedSMT::<Fp, TestHasher, 20>::new_from_u32(
+            let csmt = CompressedSMT::<Fp, TestHasher, 20>::new(
                 &leaves, &hasher, &empty_leaf,
             )
             .unwrap();
 
-            let existing_indices: Vec<u64> = leaves.keys().take(10).map(|&k| k as u64).collect();
-            let non_existent: Vec<u64> = (1..11).map(|i| i as u64).collect();
+            let existing_indices: Vec<u64> = leaves.keys().take(10).copied().collect();
+            let non_existent: Vec<u64> = (1..11).collect();
 
             let iters = 5;
 
@@ -2036,30 +1639,10 @@ mod tests {
             }
             let nonexist_dense = start.elapsed();
 
-            let start = Instant::now();
-            for _ in 0..iters {
-                for &idx in &existing_indices {
-                    let _ = csmt.generate_sparse_membership_proof(idx);
-                }
-            }
-            let existing_sparse = start.elapsed();
-
-            let start = Instant::now();
-            for _ in 0..iters {
-                for &idx in &non_existent {
-                    let _ = csmt.generate_sparse_membership_proof(idx);
-                }
-            }
-            let nonexist_sparse = start.elapsed();
-
             eprintln!("\n--- Height 20 benchmark ({} iters x 10 proofs) ---", iters);
             eprintln!(
                 "  Dense:  existing {:?}  |  non-existent {:?}",
                 existing_dense, nonexist_dense
-            );
-            eprintln!(
-                "  Sparse: existing {:?}  |  non-existent {:?}",
-                existing_sparse, nonexist_sparse
             );
         }
     }
@@ -2142,32 +1725,6 @@ mod tests {
             let proof_orig = csmt.generate_membership_proof(idx);
             let proof_rest = restored.generate_membership_proof(idx);
             assert_eq!(proof_orig.path, proof_rest.path);
-        }
-    }
-
-    #[test]
-    fn test_serialize_roundtrip_sparse_proofs() {
-        let rng = OsRng;
-        let leaves: BTreeMap<u64, Fp> =
-            (0..100).map(|i| (i * 3, Fp::random(rng))).collect();
-        let csmt = create_csmt::<15>(&leaves);
-
-        let mut buf = Vec::new();
-        csmt.serialize_to(&mut buf).unwrap();
-
-        let restored =
-            CompressedSMT::<Fp, TestHasher, 15>::deserialize_from(&mut &buf[..]).unwrap();
-
-        // Verify sparse proofs on non-existent indices
-        for idx in [1u64, 2, 4, 7, 999] {
-            let sparse_orig = csmt.generate_sparse_membership_proof(idx);
-            let sparse_rest = restored.generate_sparse_membership_proof(idx);
-            assert_eq!(sparse_orig.entries.len(), sparse_rest.entries.len());
-            for (a, b) in sparse_orig.entries.iter().zip(sparse_rest.entries.iter()) {
-                assert_eq!(a.sibling, b.sibling);
-                assert_eq!(a.direction_bit, b.direction_bit);
-                assert_eq!(a.level, b.level);
-            }
         }
     }
 

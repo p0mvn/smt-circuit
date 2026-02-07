@@ -354,7 +354,7 @@ mod tests {
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     };
     use pasta_curves::Fp;
-    use smt::poseidon::FieldHasher;
+    use smt::poseidon2::FieldHasher;
     use smt::poseidon2::Poseidon2;
 
     // ---- Test circuit: hash two inputs and constrain against expected output --
