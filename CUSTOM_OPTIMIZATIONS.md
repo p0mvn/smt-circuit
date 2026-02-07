@@ -109,3 +109,109 @@ If MAX_K is too small, `to_padded_arrays` panics at proof time. If too large, ex
 | Params size (k=12) | 0.25 MB | 0.25 MB | same |
 
 Both circuits fit in k=12. The savings come from fewer Poseidon hashes during proving, not from reducing k. The SRS size and polynomial degree are identical. The dense `PathChip` is preserved for backward compatibility.
+
+## Compressed Sparse Merkle Tree
+
+**Goal:** Replace the `BTreeMap`-based `SparseMerkleTree` with a compressed node tree that reduces memory from ~80 GB to ~6 GB for 51.7M leaves at height 53, and enables multi-core parallel construction via rayon.
+
+### Problem
+
+The `SparseMerkleTree` stores every internal node in a `BTreeMap<u64, F>`. For 51.7M leaves at height 53, this creates ~1.4 billion entries consuming ~80-90 GB of RAM. The machine swaps to disk, making construction take 10+ hours.
+
+### Approach
+
+Instead of materializing every internal node, classify each subtree by how many non-default leaves it contains:
+
+| Variant | Condition | Storage | Hash |
+|---------|-----------|---------|------|
+| `Zero` | 0 leaves in subtree | 8 bytes (tag only) | Looked up from `empty_hashes[level]` |
+| `Single` | 1 leaf | 48 bytes (index + value + hash) | Leaf hashed up through empty siblings |
+| `Double` | 2 leaves | 88 bytes (two pairs + hash) | Two Single paths merged at divergence point |
+| `Multi` | 3+ leaves | 56 bytes (hash + 2 Box ptrs) | `poseidon(left.hash, right.hash)` — only variant that recurses |
+
+**Construction** is top-down recursive. The `build()` function splits sorted leaves by the current bit position and recurses into left/right children. For subtrees with > 1024 leaves, `rayon::join` runs the two children in parallel. Hashes for `Single` and `Double` nodes are computed eagerly during construction.
+
+**Proof generation** walks the compressed tree from root to the target leaf. At `Multi` nodes, it picks the target child and records the sibling's precomputed hash. At `Single`/`Double` nodes, it fills in remaining levels with empty hashes (or the other leaf's hash at the divergence point). The resulting `Path` and `SparsePath` are identical to those produced by `SparseMerkleTree`.
+
+### Hash helpers
+
+**`compute_single_hash`** — hashes one leaf up through `level` layers of empty siblings:
+
+```
+h = leaf_value
+for l in 0..level:
+    bit = (leaf_index >> l) & 1
+    h = hash(h, empty[l])  if bit == 0
+    h = hash(empty[l], h)  if bit == 1
+```
+
+**`compute_double_hash`** — finds the divergence point of two leaves, hashes each up to that point, merges, then continues up through empty siblings:
+
+```
+div_level = highest_differing_bit(a, b) + 1
+a_hash = single_hash(a, div_level - 1)
+b_hash = single_hash(b, div_level - 1)
+h = hash(a_hash, b_hash)  [ordered by bit at div_level - 1]
+for l in div_level..level:
+    h = hash(h, empty[l]) or hash(empty[l], h)
+```
+
+### Memory analysis (51.7M leaves, N=53)
+
+Leaves are ~0.0006% dense in the 2^53 address space. Collisions begin around level ~27 from the leaf level.
+
+- Total compressed nodes: ~103M (≈ 2 × 51.7M)
+- Average node size: ~56 bytes
+- **Total memory: ~6 GB** (vs ~80-90 GB with `BTreeMap`)
+
+### Hash count analysis
+
+The total Poseidon hash count is ~1.5 billion regardless of data structure. The compressed tree does **not** reduce the total hash count — the win is purely that everything fits in RAM, eliminating swap thrashing. With rayon parallelism:
+
+| Cores | Estimated time (at 28μs/hash) |
+|-------|-------------------------------|
+| 1     | ~11 hours                     |
+| 8     | ~1.4 hours                    |
+| 16    | ~42 minutes                   |
+| 32    | ~21 minutes                   |
+
+### Public API
+
+```rust
+impl<F, H, const N: usize> CompressedSMT<F, H, N> {
+    // Build from u64-indexed leaves (full 2^N address space). H: Sync for rayon.
+    pub fn new(leaves: &BTreeMap<u64, F>, hasher: &H, empty_leaf: &[u8; 64]) -> Result<Self>;
+
+    // Backward-compatible constructor from u32-indexed leaves.
+    pub fn new_from_u32(leaves: &BTreeMap<u32, F>, hasher: &H, empty_leaf: &[u8; 64]) -> Result<Self>;
+
+    // Root hash (matches SparseMerkleTree::root() for identical inputs).
+    pub fn root(&self) -> F;
+
+    // Dense proof — all N levels. Compatible with PathChip.
+    pub fn generate_membership_proof(&self, index: u64) -> Path<F, H, N>;
+
+    // Sparse proof — only K non-empty levels. Compatible with SparsePathChip.
+    pub fn generate_sparse_membership_proof(&self, index: u64) -> SparsePath<F, H>;
+}
+```
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `smt/src/compressed_smt.rs` | New file: `CompressedNode` enum, `CompressedSMT` struct, build/hash/proof functions |
+| `smt/src/lib.rs` | Added `pub mod compressed_smt;` |
+| `smt/Cargo.toml` | Added `rayon = "1"` dependency |
+
+No changes to `chiplet/` — the compressed SMT produces the same `Path` and `SparsePath` types that the circuit chips already consume.
+
+### Test coverage
+
+| Category | Tests | What is verified |
+|----------|-------|------------------|
+| Root correctness | 7 | Identical root hash vs `SparseMerkleTree` for heights 3/10/20, 0-1000 leaves, sparse indices |
+| Node classification | 1 | Zero/Single/Double/Multi for 0/1/2/3 leaves |
+| Dense proof | 3 | Bit-exact path match vs original, membership check, sparse-index proofs |
+| Sparse proof | 3 | Entry-exact match vs original, full root reconstruction, compact root |
+| Scale | 2 | 1K leaves at height 20, 10K random leaves at height 53 |

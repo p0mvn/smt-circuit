@@ -236,7 +236,10 @@ fn build<F: PrimeField, H: FieldHasher<F, 2> + Sync>(
 ///
 /// Traverses the compressed tree from the root toward the target leaf,
 /// filling in the (left_hash, right_hash) pair and direction bit at each
-/// of the N levels. Panics if the target leaf is not in the tree.
+/// of the N levels. For non-existent leaves the path is filled with
+/// `empty_hashes[0]` as the leaf value and the correct sibling hashes
+/// from the tree, matching [`SparseMerkleTree::generate_membership_proof`]
+/// behavior.
 fn fill_path<F: PrimeField, H: FieldHasher<F, 2>>(
     node: &CompressedNode<F>,
     target_index: u64,
@@ -248,22 +251,9 @@ fn fill_path<F: PrimeField, H: FieldHasher<F, 2>>(
 ) {
     match node {
         CompressedNode::Zero => {
-            panic!(
-                "target leaf index {} not found in tree (hit Zero node)",
-                target_index
-            );
-        }
-        CompressedNode::Single {
-            leaf_index,
-            leaf_value,
-            ..
-        } => {
-            assert_eq!(
-                *leaf_index, target_index,
-                "Single node leaf index {} doesn't match target {}",
-                leaf_index, target_index
-            );
-            let mut h = *leaf_value;
+            // Non-existent leaf in an all-empty subtree.
+            // The leaf value is empty_hashes[0] (default leaf).
+            let mut h = empty_hashes[0];
             for l in 0..level {
                 let bit = (target_index >> l) & 1;
                 let sibling = empty_hashes[l];
@@ -277,65 +267,284 @@ fn fill_path<F: PrimeField, H: FieldHasher<F, 2>>(
                 h = hasher.hash([path[l].0, path[l].1]).unwrap();
             }
         }
-        CompressedNode::Double { leaf_a, leaf_b, .. } => {
-            let (target_leaf, other_leaf) = if leaf_a.0 == target_index {
-                (leaf_a, leaf_b)
+        CompressedNode::Single {
+            leaf_index,
+            leaf_value,
+            ..
+        } => {
+            if *leaf_index == target_index {
+                // Existing leaf: hash up through empty siblings.
+                let mut h = *leaf_value;
+                for l in 0..level {
+                    let bit = (target_index >> l) & 1;
+                    let sibling = empty_hashes[l];
+                    if bit == 0 {
+                        path[l] = (h, sibling);
+                        direction_bits[l] = false;
+                    } else {
+                        path[l] = (sibling, h);
+                        direction_bits[l] = true;
+                    }
+                    h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                }
             } else {
-                assert_eq!(
-                    leaf_b.0, target_index,
-                    "Double node doesn't contain target leaf {}",
-                    target_index
-                );
-                (leaf_b, leaf_a)
+                // Non-existent leaf within a Single subtree.
+                // Target is empty; the existing leaf appears as a
+                // sibling at the divergence level.
+                let xor = target_index ^ *leaf_index;
+                let div_level = (64 - xor.leading_zeros()) as usize;
+                let mut h = empty_hashes[0];
+
+                // Below divergence: empty siblings
+                for l in 0..(div_level - 1) {
+                    let bit = (target_index >> l) & 1;
+                    let sibling = empty_hashes[l];
+                    if bit == 0 {
+                        path[l] = (h, sibling);
+                        direction_bits[l] = false;
+                    } else {
+                        path[l] = (sibling, h);
+                        direction_bits[l] = true;
+                    }
+                    h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                }
+
+                // At divergence: existing leaf's hash is the sibling
+                {
+                    let l = div_level - 1;
+                    let other_hash = compute_single_hash(
+                        (*leaf_index, *leaf_value),
+                        div_level - 1,
+                        hasher,
+                        empty_hashes,
+                    );
+                    let bit = (target_index >> l) & 1;
+                    if bit == 0 {
+                        path[l] = (h, other_hash);
+                        direction_bits[l] = false;
+                    } else {
+                        path[l] = (other_hash, h);
+                        direction_bits[l] = true;
+                    }
+                    h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                }
+
+                // Above divergence: empty siblings
+                for l in div_level..level {
+                    let bit = (target_index >> l) & 1;
+                    let sibling = empty_hashes[l];
+                    if bit == 0 {
+                        path[l] = (h, sibling);
+                        direction_bits[l] = false;
+                    } else {
+                        path[l] = (sibling, h);
+                        direction_bits[l] = true;
+                    }
+                    h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                }
+            }
+        }
+        CompressedNode::Double { leaf_a, leaf_b, .. } => {
+            let matched = if leaf_a.0 == target_index {
+                Some((leaf_a, leaf_b))
+            } else if leaf_b.0 == target_index {
+                Some((leaf_b, leaf_a))
+            } else {
+                None
             };
 
-            let xor = target_leaf.0 ^ other_leaf.0;
-            let div_level = (64 - xor.leading_zeros()) as usize;
+            if let Some((target_leaf, other_leaf)) = matched {
+                // Existing leaf in Double subtree (unchanged logic).
+                let xor = target_leaf.0 ^ other_leaf.0;
+                let div_level = (64 - xor.leading_zeros()) as usize;
+                let mut h = target_leaf.1;
 
-            let mut h = target_leaf.1;
-
-            // Below divergence: empty siblings
-            for l in 0..(div_level - 1) {
-                let bit = (target_index >> l) & 1;
-                let sibling = empty_hashes[l];
-                if bit == 0 {
-                    path[l] = (h, sibling);
-                    direction_bits[l] = false;
-                } else {
-                    path[l] = (sibling, h);
-                    direction_bits[l] = true;
+                // Below divergence: empty siblings
+                for l in 0..(div_level - 1) {
+                    let bit = (target_index >> l) & 1;
+                    let sibling = empty_hashes[l];
+                    if bit == 0 {
+                        path[l] = (h, sibling);
+                        direction_bits[l] = false;
+                    } else {
+                        path[l] = (sibling, h);
+                        direction_bits[l] = true;
+                    }
+                    h = hasher.hash([path[l].0, path[l].1]).unwrap();
                 }
-                h = hasher.hash([path[l].0, path[l].1]).unwrap();
-            }
 
-            // At divergence level: other leaf's hash is the sibling
-            {
-                let l = div_level - 1;
-                let other_hash =
-                    compute_single_hash(*other_leaf, div_level - 1, hasher, empty_hashes);
-                let bit = (target_index >> l) & 1;
-                if bit == 0 {
-                    path[l] = (h, other_hash);
-                    direction_bits[l] = false;
-                } else {
-                    path[l] = (other_hash, h);
-                    direction_bits[l] = true;
+                // At divergence level: other leaf's hash is the sibling
+                {
+                    let l = div_level - 1;
+                    let other_hash =
+                        compute_single_hash(*other_leaf, div_level - 1, hasher, empty_hashes);
+                    let bit = (target_index >> l) & 1;
+                    if bit == 0 {
+                        path[l] = (h, other_hash);
+                        direction_bits[l] = false;
+                    } else {
+                        path[l] = (other_hash, h);
+                        direction_bits[l] = true;
+                    }
+                    h = hasher.hash([path[l].0, path[l].1]).unwrap();
                 }
-                h = hasher.hash([path[l].0, path[l].1]).unwrap();
-            }
 
-            // Above divergence: empty siblings
-            for l in div_level..level {
-                let bit = (target_index >> l) & 1;
-                let sibling = empty_hashes[l];
-                if bit == 0 {
-                    path[l] = (h, sibling);
-                    direction_bits[l] = false;
-                } else {
-                    path[l] = (sibling, h);
-                    direction_bits[l] = true;
+                // Above divergence: empty siblings
+                for l in div_level..level {
+                    let bit = (target_index >> l) & 1;
+                    let sibling = empty_hashes[l];
+                    if bit == 0 {
+                        path[l] = (h, sibling);
+                        direction_bits[l] = false;
+                    } else {
+                        path[l] = (sibling, h);
+                        direction_bits[l] = true;
+                    }
+                    h = hasher.hash([path[l].0, path[l].1]).unwrap();
                 }
-                h = hasher.hash([path[l].0, path[l].1]).unwrap();
+            } else {
+                // Non-existent target in a Double subtree.
+                // Both existing leaves appear as siblings on the target's path.
+                let xor_a = target_index ^ leaf_a.0;
+                let xor_b = target_index ^ leaf_b.0;
+                let div_a = (64 - xor_a.leading_zeros()) as usize;
+                let div_b = (64 - xor_b.leading_zeros()) as usize;
+                let mut h = empty_hashes[0];
+
+                if div_a == div_b {
+                    // Both leaves diverge from target at the same level.
+                    // They appear together as a combined Double sibling.
+
+                    // Below divergence: empty siblings
+                    for l in 0..(div_a - 1) {
+                        let bit = (target_index >> l) & 1;
+                        let sibling = empty_hashes[l];
+                        if bit == 0 {
+                            path[l] = (h, sibling);
+                            direction_bits[l] = false;
+                        } else {
+                            path[l] = (sibling, h);
+                            direction_bits[l] = true;
+                        }
+                        h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                    }
+
+                    // At divergence: combined hash of both leaves
+                    {
+                        let l = div_a - 1;
+                        let combined = compute_double_hash(
+                            *leaf_a, *leaf_b, div_a - 1, hasher, empty_hashes,
+                        );
+                        let bit = (target_index >> l) & 1;
+                        if bit == 0 {
+                            path[l] = (h, combined);
+                            direction_bits[l] = false;
+                        } else {
+                            path[l] = (combined, h);
+                            direction_bits[l] = true;
+                        }
+                        h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                    }
+
+                    // Above divergence: empty siblings
+                    for l in div_a..level {
+                        let bit = (target_index >> l) & 1;
+                        let sibling = empty_hashes[l];
+                        if bit == 0 {
+                            path[l] = (h, sibling);
+                            direction_bits[l] = false;
+                        } else {
+                            path[l] = (sibling, h);
+                            direction_bits[l] = true;
+                        }
+                        h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                    }
+                } else {
+                    // Leaves diverge from target at different levels.
+                    // The closer leaf is a sibling at the lower level,
+                    // the farther leaf at the higher level.
+                    let (close, far, close_div, far_div) = if div_a < div_b {
+                        (leaf_a, leaf_b, div_a, div_b)
+                    } else {
+                        (leaf_b, leaf_a, div_b, div_a)
+                    };
+
+                    // Below close divergence: empty siblings
+                    for l in 0..(close_div - 1) {
+                        let bit = (target_index >> l) & 1;
+                        let sibling = empty_hashes[l];
+                        if bit == 0 {
+                            path[l] = (h, sibling);
+                            direction_bits[l] = false;
+                        } else {
+                            path[l] = (sibling, h);
+                            direction_bits[l] = true;
+                        }
+                        h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                    }
+
+                    // At close divergence: close leaf as sibling
+                    {
+                        let l = close_div - 1;
+                        let close_hash = compute_single_hash(
+                            *close, close_div - 1, hasher, empty_hashes,
+                        );
+                        let bit = (target_index >> l) & 1;
+                        if bit == 0 {
+                            path[l] = (h, close_hash);
+                            direction_bits[l] = false;
+                        } else {
+                            path[l] = (close_hash, h);
+                            direction_bits[l] = true;
+                        }
+                        h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                    }
+
+                    // Between close and far divergence: empty siblings
+                    for l in close_div..(far_div - 1) {
+                        let bit = (target_index >> l) & 1;
+                        let sibling = empty_hashes[l];
+                        if bit == 0 {
+                            path[l] = (h, sibling);
+                            direction_bits[l] = false;
+                        } else {
+                            path[l] = (sibling, h);
+                            direction_bits[l] = true;
+                        }
+                        h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                    }
+
+                    // At far divergence: far leaf as sibling
+                    {
+                        let l = far_div - 1;
+                        let far_hash = compute_single_hash(
+                            *far, far_div - 1, hasher, empty_hashes,
+                        );
+                        let bit = (target_index >> l) & 1;
+                        if bit == 0 {
+                            path[l] = (h, far_hash);
+                            direction_bits[l] = false;
+                        } else {
+                            path[l] = (far_hash, h);
+                            direction_bits[l] = true;
+                        }
+                        h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                    }
+
+                    // Above far divergence: empty siblings
+                    for l in far_div..level {
+                        let bit = (target_index >> l) & 1;
+                        let sibling = empty_hashes[l];
+                        if bit == 0 {
+                            path[l] = (h, sibling);
+                            direction_bits[l] = false;
+                        } else {
+                            path[l] = (sibling, h);
+                            direction_bits[l] = true;
+                        }
+                        h = hasher.hash([path[l].0, path[l].1]).unwrap();
+                    }
+                }
             }
         }
         CompressedNode::Multi { left, right, .. } => {
@@ -383,7 +592,9 @@ fn fill_path<F: PrimeField, H: FieldHasher<F, 2>>(
 ///
 /// Traverses the compressed tree, adding a `SparsePathEntry` only when
 /// the sibling hash differs from the precomputed empty hash at that level.
-/// Entries are naturally produced in ascending level order (leaf → root).
+/// Entries are naturally produced in ascending level order (leaf -> root).
+/// For non-existent leaves, entries are produced for the actual non-empty
+/// siblings along the path, matching [`SparseMerkleTree`] behavior.
 fn collect_sparse_entries<F: PrimeField, H: FieldHasher<F, 2>>(
     node: &CompressedNode<F>,
     target_index: u64,
@@ -394,44 +605,98 @@ fn collect_sparse_entries<F: PrimeField, H: FieldHasher<F, 2>>(
 ) {
     match node {
         CompressedNode::Zero => {
-            panic!(
-                "target leaf index {} not found in tree (hit Zero node)",
-                target_index
-            );
+            // Non-existent leaf in an all-empty subtree: no non-empty siblings.
         }
-        CompressedNode::Single { leaf_index, .. } => {
-            assert_eq!(
-                *leaf_index, target_index,
-                "Single node leaf index {} doesn't match target {}",
-                leaf_index, target_index
-            );
-            // All siblings within a Single node are empty hashes — no entries to add.
+        CompressedNode::Single {
+            leaf_index,
+            leaf_value,
+            ..
+        } => {
+            if *leaf_index == target_index {
+                // All siblings within a Single node are empty hashes — no entries to add.
+            } else {
+                // Non-existent leaf: existing leaf is a non-empty sibling
+                // at the divergence level.
+                let xor = target_index ^ *leaf_index;
+                let div_level = (64 - xor.leading_zeros()) as usize;
+                let sibling_hash = compute_single_hash(
+                    (*leaf_index, *leaf_value),
+                    div_level - 1,
+                    hasher,
+                    empty_hashes,
+                );
+                let bit = (target_index >> (div_level - 1)) & 1;
+                entries.push(SparsePathEntry {
+                    sibling: sibling_hash,
+                    direction_bit: bit == 1,
+                    level: div_level - 1,
+                });
+            }
         }
         CompressedNode::Double { leaf_a, leaf_b, .. } => {
-            let other = if leaf_a.0 == target_index {
-                leaf_b
+            if leaf_a.0 == target_index || leaf_b.0 == target_index {
+                // Target matches one leaf; the other is a sibling at divergence.
+                let other = if leaf_a.0 == target_index {
+                    leaf_b
+                } else {
+                    leaf_a
+                };
+                let xor = target_index ^ other.0;
+                let div_level = (64 - xor.leading_zeros()) as usize;
+                let sibling_hash =
+                    compute_single_hash(*other, div_level - 1, hasher, empty_hashes);
+                let bit = (target_index >> (div_level - 1)) & 1;
+                entries.push(SparsePathEntry {
+                    sibling: sibling_hash,
+                    direction_bit: bit == 1,
+                    level: div_level - 1,
+                });
             } else {
-                assert_eq!(
-                    leaf_b.0, target_index,
-                    "Double node doesn't contain target leaf {}",
-                    target_index
-                );
-                leaf_a
-            };
+                // Non-existent target: both leaves appear as siblings.
+                let xor_a = target_index ^ leaf_a.0;
+                let xor_b = target_index ^ leaf_b.0;
+                let div_a = (64 - xor_a.leading_zeros()) as usize;
+                let div_b = (64 - xor_b.leading_zeros()) as usize;
 
-            let xor = target_index ^ other.0;
-            let div_level = (64 - xor.leading_zeros()) as usize;
-
-            // The other leaf appears as a non-empty sibling at the divergence level.
-            let sibling_hash =
-                compute_single_hash(*other, div_level - 1, hasher, empty_hashes);
-            let bit = (target_index >> (div_level - 1)) & 1;
-
-            entries.push(SparsePathEntry {
-                sibling: sibling_hash,
-                direction_bit: bit == 1,
-                level: div_level - 1,
-            });
+                if div_a == div_b {
+                    // Both leaves diverge at the same level — combined sibling.
+                    let combined = compute_double_hash(
+                        *leaf_a, *leaf_b, div_a - 1, hasher, empty_hashes,
+                    );
+                    let bit = (target_index >> (div_a - 1)) & 1;
+                    entries.push(SparsePathEntry {
+                        sibling: combined,
+                        direction_bit: bit == 1,
+                        level: div_a - 1,
+                    });
+                } else {
+                    // Leaves at different divergence levels — two entries
+                    // pushed in ascending level order.
+                    let (close, far, close_div, far_div) = if div_a < div_b {
+                        (leaf_a, leaf_b, div_a, div_b)
+                    } else {
+                        (leaf_b, leaf_a, div_b, div_a)
+                    };
+                    let close_hash = compute_single_hash(
+                        *close, close_div - 1, hasher, empty_hashes,
+                    );
+                    let close_bit = (target_index >> (close_div - 1)) & 1;
+                    entries.push(SparsePathEntry {
+                        sibling: close_hash,
+                        direction_bit: close_bit == 1,
+                        level: close_div - 1,
+                    });
+                    let far_hash = compute_single_hash(
+                        *far, far_div - 1, hasher, empty_hashes,
+                    );
+                    let far_bit = (target_index >> (far_div - 1)) & 1;
+                    entries.push(SparsePathEntry {
+                        sibling: far_hash,
+                        direction_bit: far_bit == 1,
+                        level: far_div - 1,
+                    });
+                }
+            }
         }
         CompressedNode::Multi { left, right, .. } => {
             let bit = (target_index >> (level - 1)) & 1;
@@ -567,9 +832,11 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
     ///
     /// Returns a [`Path`] compatible with `PathChip`.
     ///
-    /// # Panics
-    ///
-    /// Panics if `index` is not a leaf in this tree.
+    /// For non-existent indices the returned path proves that the leaf
+    /// value at `index` is the default empty leaf (`empty_hashes[0]`),
+    /// with the correct sibling hashes from the tree. This matches the
+    /// behavior of [`SparseMerkleTree::generate_membership_proof`] and
+    /// is required for exclusion proofs.
     pub fn generate_membership_proof(&self, index: u64) -> Path<F, H, N> {
         let hasher = H::hasher();
         let mut path = [(F::ZERO, F::ZERO); N];
@@ -597,9 +864,9 @@ impl<F: PrimeField + FromUniformBytes<64>, H: FieldHasher<F, 2>, const N: usize>
     /// Returns a [`SparsePath`] compatible with `SparsePathChip`.
     /// The proof has K entries where K << N for sparse trees.
     ///
-    /// # Panics
-    ///
-    /// Panics if `index` is not a leaf in this tree.
+    /// For non-existent indices, the proof contains entries for the
+    /// actual non-empty siblings along the path, matching
+    /// [`SparseMerkleTree::generate_sparse_membership_proof`] behavior.
     pub fn generate_sparse_membership_proof(&self, index: u64) -> SparsePath<F, H> {
         let hasher = H::hasher();
         let mut entries = Vec::new();
@@ -1011,6 +1278,457 @@ mod tests {
                 csmt.root(),
                 "sparse full root mismatch for leaf {}",
                 idx
+            );
+        }
+    }
+
+    // ---- Non-existent index (exclusion) proof tests ----
+
+    #[test]
+    fn test_nonexistent_proof_zero_node() {
+        // Empty tree (Zero root): proofs for any index should match
+        // between CompressedSMT and SparseMerkleTree.
+        //
+        // Note: check_membership is not used here because the library's
+        // root() for an empty tree returns empty_hashes[N-1], while
+        // calculate_root hashes through all N levels producing a
+        // different value. This is a pre-existing library convention
+        // and doesn't affect real use (exclusion proofs require at
+        // least one leaf in the tree).
+        let leaves: BTreeMap<u32, Fp> = BTreeMap::new();
+        let (smt, csmt) = create_both::<10>(&leaves);
+
+        // Roots should match between the two implementations
+        assert_eq!(smt.root(), csmt.root());
+
+        for idx in [0u64, 1, 512, 1023] {
+            let csmt_proof = csmt.generate_membership_proof(idx);
+            let smt_proof = smt.generate_membership_proof(idx);
+
+            // Path should match the original SMT field-by-field
+            for level in 0..10 {
+                assert_eq!(
+                    smt_proof.path[level], csmt_proof.path[level],
+                    "path mismatch at level {} for non-existent index {}",
+                    level, idx
+                );
+                assert_eq!(
+                    smt_proof.direction_bits[level], csmt_proof.direction_bits[level],
+                    "direction_bit mismatch at level {} for non-existent index {}",
+                    level, idx
+                );
+            }
+        }
+
+        // Also verify sparse proofs match
+        for idx in [0u64, 1, 512, 1023] {
+            let csmt_sparse = csmt.generate_sparse_membership_proof(idx);
+            let smt_sparse = smt.generate_sparse_membership_proof(idx);
+            assert_eq!(
+                smt_sparse.entries.len(),
+                csmt_sparse.entries.len(),
+                "sparse entry count mismatch for index {} in empty tree",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_nonexistent_proof_single_mismatch() {
+        // Tree with one leaf at index 5: proof for index 3 should
+        // return the empty leaf with the correct sibling hashes.
+        let poseidon = Poseidon::<Fp, 2>::new();
+        let empty_leaf = [0u8; 64];
+        let rng = OsRng;
+        let leaves: BTreeMap<u32, Fp> = [(5, Fp::random(rng))].into_iter().collect();
+        let (smt, csmt) = create_both::<10>(&leaves);
+        let empty_val = Fp::from_uniform_bytes(&empty_leaf);
+
+        for idx in [0u64, 3, 4, 6, 100, 1023] {
+            let csmt_proof = csmt.generate_membership_proof(idx);
+            let smt_proof = smt.generate_membership_proof(idx);
+
+            for level in 0..10 {
+                assert_eq!(
+                    smt_proof.path[level], csmt_proof.path[level],
+                    "path mismatch at level {} for non-existent index {} (single leaf at 5)",
+                    level, idx
+                );
+                assert_eq!(
+                    smt_proof.direction_bits[level], csmt_proof.direction_bits[level],
+                    "direction_bit mismatch at level {} for non-existent index {}",
+                    level, idx
+                );
+            }
+
+            let ok = csmt_proof
+                .check_membership(&csmt.root(), &empty_val, &poseidon)
+                .unwrap();
+            assert!(ok, "membership check failed for non-existent index {}", idx);
+        }
+    }
+
+    #[test]
+    fn test_nonexistent_proof_double_mismatch() {
+        // Tree with leaves at indices 2 and 7: proof for index 4
+        // should work correctly.
+        let poseidon = Poseidon::<Fp, 2>::new();
+        let empty_leaf = [0u8; 64];
+        let rng = OsRng;
+        let leaves: BTreeMap<u32, Fp> = [(2, Fp::random(rng)), (7, Fp::random(rng))]
+            .into_iter()
+            .collect();
+        let (smt, csmt) = create_both::<10>(&leaves);
+        let empty_val = Fp::from_uniform_bytes(&empty_leaf);
+
+        // Test indices that exercise different divergence patterns:
+        // - idx 0: diverges from leaf 2 at level 2, leaf 7 at level 3
+        // - idx 4: diverges from both at level 3 (same-level divergence)
+        // - idx 3: diverges from leaf 2 at level 1, leaf 7 at level 3
+        // - idx 1023: diverges at high level
+        for idx in [0u64, 1, 3, 4, 5, 6, 8, 100, 1023] {
+            let csmt_proof = csmt.generate_membership_proof(idx);
+            let smt_proof = smt.generate_membership_proof(idx);
+
+            for level in 0..10 {
+                assert_eq!(
+                    smt_proof.path[level], csmt_proof.path[level],
+                    "path mismatch at level {} for non-existent index {} (leaves at 2,7)",
+                    level, idx
+                );
+                assert_eq!(
+                    smt_proof.direction_bits[level], csmt_proof.direction_bits[level],
+                    "direction_bit mismatch at level {} for non-existent index {}",
+                    level, idx
+                );
+            }
+
+            let ok = csmt_proof
+                .check_membership(&csmt.root(), &empty_val, &poseidon)
+                .unwrap();
+            assert!(ok, "membership check failed for non-existent index {}", idx);
+        }
+    }
+
+    #[test]
+    fn test_nonexistent_proof_multi_descend_into_zero() {
+        // Tree with leaves clustered on the left side (indices 0..8),
+        // probing an index on the empty right side.
+        let poseidon = Poseidon::<Fp, 2>::new();
+        let empty_leaf = [0u8; 64];
+        let rng = OsRng;
+        let leaves: BTreeMap<u32, Fp> =
+            (0..8).map(|i| (i, Fp::random(rng))).collect();
+        let (smt, csmt) = create_both::<10>(&leaves);
+        let empty_val = Fp::from_uniform_bytes(&empty_leaf);
+
+        // These indices are in the empty right half of the tree
+        for idx in [512u64, 600, 1023] {
+            let csmt_proof = csmt.generate_membership_proof(idx);
+            let smt_proof = smt.generate_membership_proof(idx);
+
+            for level in 0..10 {
+                assert_eq!(
+                    smt_proof.path[level], csmt_proof.path[level],
+                    "path mismatch at level {} for non-existent index {} (multi→zero)",
+                    level, idx
+                );
+                assert_eq!(
+                    smt_proof.direction_bits[level], csmt_proof.direction_bits[level],
+                    "direction_bit mismatch at level {} for non-existent index {}",
+                    level, idx
+                );
+            }
+
+            let ok = csmt_proof
+                .check_membership(&csmt.root(), &empty_val, &poseidon)
+                .unwrap();
+            assert!(ok, "membership check failed for non-existent index {}", idx);
+        }
+
+        // Also probe non-existent indices within the populated half
+        for idx in [9u64, 15, 100] {
+            let csmt_proof = csmt.generate_membership_proof(idx);
+            let smt_proof = smt.generate_membership_proof(idx);
+
+            for level in 0..10 {
+                assert_eq!(
+                    smt_proof.path[level], csmt_proof.path[level],
+                    "path mismatch at level {} for non-existent index {} (within multi)",
+                    level, idx
+                );
+            }
+
+            let ok = csmt_proof
+                .check_membership(&csmt.root(), &empty_val, &poseidon)
+                .unwrap();
+            assert!(ok, "membership check failed for non-existent index {}", idx);
+        }
+    }
+
+    #[test]
+    fn test_nonexistent_proof_matches_original_smt() {
+        // For several tree configurations, insert random leaves then
+        // probe non-existent indices — assert CompressedSMT matches
+        // SparseMerkleTree field-by-field.
+        let rng = OsRng;
+        let empty_leaf = [0u8; 64];
+        let poseidon = Poseidon::<Fp, 2>::new();
+        let empty_val = Fp::from_uniform_bytes(&empty_leaf);
+
+        // Height 3, 3 leaves
+        {
+            let leaves: BTreeMap<u32, Fp> =
+                [(0, Fp::random(rng)), (3, Fp::random(rng)), (7, Fp::random(rng))]
+                    .into_iter()
+                    .collect();
+            let (smt, csmt) = create_both::<3>(&leaves);
+            for idx in [1u64, 2, 4, 5, 6] {
+                let smt_proof = smt.generate_membership_proof(idx);
+                let csmt_proof = csmt.generate_membership_proof(idx);
+                for level in 0..3 {
+                    assert_eq!(smt_proof.path[level], csmt_proof.path[level]);
+                    assert_eq!(smt_proof.direction_bits[level], csmt_proof.direction_bits[level]);
+                }
+                assert!(csmt_proof.check_membership(&csmt.root(), &empty_val, &poseidon).unwrap());
+            }
+        }
+
+        // Height 10, 20 random leaves, 10 non-existent probes
+        {
+            let leaves: BTreeMap<u32, Fp> =
+                (0..20).map(|i| (i * 50, Fp::random(rng))).collect();
+            let (smt, csmt) = create_both::<10>(&leaves);
+            let non_existent = [1u64, 2, 49, 51, 99, 101, 200, 500, 800, 1023];
+            for &idx in &non_existent {
+                let smt_proof = smt.generate_membership_proof(idx);
+                let csmt_proof = csmt.generate_membership_proof(idx);
+                for level in 0..10 {
+                    assert_eq!(
+                        smt_proof.path[level], csmt_proof.path[level],
+                        "H10 path mismatch at level {} for index {}",
+                        level, idx
+                    );
+                    assert_eq!(
+                        smt_proof.direction_bits[level], csmt_proof.direction_bits[level],
+                        "H10 dir mismatch at level {} for index {}",
+                        level, idx
+                    );
+                }
+                assert!(csmt_proof.check_membership(&csmt.root(), &empty_val, &poseidon).unwrap());
+            }
+        }
+
+        // Height 20, sparse leaves
+        {
+            let indices = [0u32, 100, 500, 10_000, 100_000, 500_000];
+            let leaves: BTreeMap<u32, Fp> =
+                indices.iter().map(|&i| (i, Fp::random(rng))).collect();
+            let (smt, csmt) = create_both::<20>(&leaves);
+            let non_existent = [1u64, 50, 99, 101, 250, 501, 9999, 10001, 99999, 999_999];
+            for &idx in &non_existent {
+                let smt_proof = smt.generate_membership_proof(idx);
+                let csmt_proof = csmt.generate_membership_proof(idx);
+                for level in 0..20 {
+                    assert_eq!(
+                        smt_proof.path[level], csmt_proof.path[level],
+                        "H20 path mismatch at level {} for index {}",
+                        level, idx
+                    );
+                    assert_eq!(
+                        smt_proof.direction_bits[level], csmt_proof.direction_bits[level],
+                        "H20 dir mismatch at level {} for index {}",
+                        level, idx
+                    );
+                }
+                assert!(csmt_proof.check_membership(&csmt.root(), &empty_val, &poseidon).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn test_nonexistent_sparse_proof() {
+        // Verify sparse proofs for non-existent indices match the
+        // original SMT and produce the correct full root.
+        let rng = OsRng;
+        let empty_leaf = [0u8; 64];
+        let poseidon = Poseidon::<Fp, 2>::new();
+        let empty_val = Fp::from_uniform_bytes(&empty_leaf);
+
+        let indices = [0u32, 5, 13, 100, 500, 1000];
+        let leaves: BTreeMap<u32, Fp> =
+            indices.iter().map(|&i| (i, Fp::random(rng))).collect();
+        let (smt, csmt) = create_both::<20>(&leaves);
+
+        let non_existent = [1u64, 4, 6, 12, 14, 50, 101, 501, 999, 1001];
+        for &idx in &non_existent {
+            let smt_sparse = smt.generate_sparse_membership_proof(idx);
+            let csmt_sparse = csmt.generate_sparse_membership_proof(idx);
+
+            assert_eq!(
+                smt_sparse.entries.len(),
+                csmt_sparse.entries.len(),
+                "sparse entry count mismatch for non-existent index {}",
+                idx
+            );
+
+            for (i, (s, c)) in smt_sparse
+                .entries
+                .iter()
+                .zip(csmt_sparse.entries.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    s.sibling, c.sibling,
+                    "sparse sibling mismatch at entry {} for index {}",
+                    i, idx
+                );
+                assert_eq!(
+                    s.direction_bit, c.direction_bit,
+                    "sparse direction_bit mismatch at entry {} for index {}",
+                    i, idx
+                );
+                assert_eq!(
+                    s.level, c.level,
+                    "sparse level mismatch at entry {} for index {}",
+                    i, idx
+                );
+            }
+
+            // Full root should match
+            let full_root = csmt_sparse
+                .calculate_full_root(&empty_val, &poseidon, idx)
+                .unwrap();
+            assert_eq!(
+                full_root,
+                csmt.root(),
+                "sparse full root mismatch for non-existent index {}",
+                idx
+            );
+        }
+    }
+
+    // ---- Benchmarks ----
+
+    #[test]
+    fn test_bench_existing_vs_nonexistent() {
+        use std::time::Instant;
+
+        let rng = OsRng;
+        let hasher = Poseidon::<Fp, 2>::new();
+        let empty_leaf = [0u8; 64];
+
+        // Height 10, 50 leaves
+        {
+            let leaves: BTreeMap<u32, Fp> =
+                (0..50).map(|i| (i, Fp::random(rng))).collect();
+            let csmt = CompressedSMT::<Fp, TestHasher, 10>::new_from_u32(
+                &leaves, &hasher, &empty_leaf,
+            )
+            .unwrap();
+
+            let existing_indices: Vec<u64> = leaves.keys().map(|&k| k as u64).collect();
+            let non_existent: Vec<u64> = (50..150).map(|i| i as u64).collect();
+
+            let iters = 100;
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                for &idx in &existing_indices[..10] {
+                    let _ = csmt.generate_membership_proof(idx);
+                }
+            }
+            let existing_dense = start.elapsed();
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                for &idx in &non_existent[..10] {
+                    let _ = csmt.generate_membership_proof(idx);
+                }
+            }
+            let nonexist_dense = start.elapsed();
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                for &idx in &existing_indices[..10] {
+                    let _ = csmt.generate_sparse_membership_proof(idx);
+                }
+            }
+            let existing_sparse = start.elapsed();
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                for &idx in &non_existent[..10] {
+                    let _ = csmt.generate_sparse_membership_proof(idx);
+                }
+            }
+            let nonexist_sparse = start.elapsed();
+
+            eprintln!("\n--- Height 10 benchmark ({} iters x 10 proofs) ---", iters);
+            eprintln!(
+                "  Dense:  existing {:?}  |  non-existent {:?}",
+                existing_dense, nonexist_dense
+            );
+            eprintln!(
+                "  Sparse: existing {:?}  |  non-existent {:?}",
+                existing_sparse, nonexist_sparse
+            );
+        }
+
+        // Height 20, 100 sparse leaves (only CompressedSMT, skips slow old SMT build)
+        {
+            let leaves: BTreeMap<u32, Fp> =
+                (0..100).map(|i| (i * 100, Fp::random(rng))).collect();
+            let csmt = CompressedSMT::<Fp, TestHasher, 20>::new_from_u32(
+                &leaves, &hasher, &empty_leaf,
+            )
+            .unwrap();
+
+            let existing_indices: Vec<u64> = leaves.keys().take(10).map(|&k| k as u64).collect();
+            let non_existent: Vec<u64> = (1..11).map(|i| i as u64).collect();
+
+            let iters = 50;
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                for &idx in &existing_indices {
+                    let _ = csmt.generate_membership_proof(idx);
+                }
+            }
+            let existing_dense = start.elapsed();
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                for &idx in &non_existent {
+                    let _ = csmt.generate_membership_proof(idx);
+                }
+            }
+            let nonexist_dense = start.elapsed();
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                for &idx in &existing_indices {
+                    let _ = csmt.generate_sparse_membership_proof(idx);
+                }
+            }
+            let existing_sparse = start.elapsed();
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                for &idx in &non_existent {
+                    let _ = csmt.generate_sparse_membership_proof(idx);
+                }
+            }
+            let nonexist_sparse = start.elapsed();
+
+            eprintln!("\n--- Height 20 benchmark ({} iters x 10 proofs) ---", iters);
+            eprintln!(
+                "  Dense:  existing {:?}  |  non-existent {:?}",
+                existing_dense, nonexist_dense
+            );
+            eprintln!(
+                "  Sparse: existing {:?}  |  non-existent {:?}",
+                existing_sparse, nonexist_sparse
             );
         }
     }
