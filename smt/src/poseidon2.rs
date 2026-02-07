@@ -26,8 +26,6 @@ use crate::poseidon::FieldHasher;
 use crate::poseidon2_params::{MAT_INTERNAL_DIAG_M_1, ROUND_CONSTANTS};
 use anyhow::Result;
 use ff::{FromUniformBytes, PrimeField};
-use std::marker::PhantomData;
-
 // ---- Poseidon2 constants ----
 
 pub const T: usize = 3; // state width
@@ -67,6 +65,7 @@ pub fn from_hex<F: PrimeField>(s: &str) -> F {
 // ---- Parsed parameter cache ----
 
 /// Parsed Poseidon2 parameters (round constants + internal matrix diagonal).
+#[derive(Clone, Debug)]
 pub struct Poseidon2Params<F: PrimeField> {
     pub round_constants: [[F; T]; ROUNDS],
     pub mat_internal_diag_m_1: [F; T],
@@ -188,9 +187,7 @@ fn poseidon2_permutation<F: PrimeField>(state: &mut [F; T], params: &Poseidon2Pa
 /// Uses width = 3, rate = 2. Domain separation: `state[RATE] = L` (input length
 /// encoded in the capacity element). Input is absorbed in rate-sized chunks,
 /// then the first state element is squeezed as output.
-fn poseidon2_hash<F: PrimeField, const L: usize>(inputs: [F; L]) -> F {
-    let params = Poseidon2Params::<F>::new();
-
+fn poseidon2_hash<F: PrimeField, const L: usize>(inputs: [F; L], params: &Poseidon2Params<F>) -> F {
     // Initialise state with domain separation in capacity
     let mut state = [F::ZERO; T];
     state[RATE] = F::from(L as u64);
@@ -220,12 +217,19 @@ fn poseidon2_hash<F: PrimeField, const L: usize>(inputs: [F; L]) -> F {
 ///
 /// Generic over field `F` and input length `L` (typically `L = 2` for Merkle
 /// tree hashing).
+///
+/// The parsed round constants are cached inside the struct so that hex-to-field
+/// parsing happens only once (at construction), not on every hash call.
 #[derive(Debug, Clone)]
-pub struct Poseidon2<F: PrimeField, const L: usize>(PhantomData<F>);
+pub struct Poseidon2<F: PrimeField, const L: usize> {
+    params: Poseidon2Params<F>,
+}
 
 impl<F: PrimeField, const L: usize> Poseidon2<F, L> {
     pub fn new() -> Self {
-        Poseidon2(PhantomData)
+        Poseidon2 {
+            params: Poseidon2Params::new(),
+        }
     }
 }
 
@@ -240,7 +244,7 @@ where
     F: PrimeField + FromUniformBytes<64> + Ord,
 {
     fn hash(&self, inputs: [F; L]) -> Result<F> {
-        Ok(poseidon2_hash(inputs))
+        Ok(poseidon2_hash(inputs, &self.params))
     }
 
     fn hasher() -> Self {
@@ -280,29 +284,32 @@ mod tests {
     /// Determinism: same input always produces same output.
     #[test]
     fn poseidon2_hash_deterministic() {
+        let params = Poseidon2Params::<Fp>::new();
         let a = Fp::from(6u64);
         let b = Fp::from(42u64);
 
-        let h1 = poseidon2_hash([a, b]);
-        let h2 = poseidon2_hash([a, b]);
+        let h1 = poseidon2_hash([a, b], &params);
+        let h2 = poseidon2_hash([a, b], &params);
         assert_eq!(h1, h2, "hash should be deterministic");
     }
 
     /// Non-zero: hash output is not the zero element.
     #[test]
     fn poseidon2_hash_nonzero() {
+        let params = Poseidon2Params::<Fp>::new();
         let a = Fp::from(6u64);
         let b = Fp::from(42u64);
-        let h = poseidon2_hash([a, b]);
+        let h = poseidon2_hash([a, b], &params);
         assert_ne!(h, Fp::from(0u64), "hash should be non-zero");
     }
 
     /// Collision resistance: different inputs produce different outputs.
     #[test]
     fn poseidon2_hash_collision() {
-        let h1 = poseidon2_hash([Fp::from(6u64), Fp::from(42u64)]);
-        let h2 = poseidon2_hash([Fp::from(7u64), Fp::from(42u64)]);
-        let h3 = poseidon2_hash([Fp::from(6u64), Fp::from(43u64)]);
+        let params = Poseidon2Params::<Fp>::new();
+        let h1 = poseidon2_hash([Fp::from(6u64), Fp::from(42u64)], &params);
+        let h2 = poseidon2_hash([Fp::from(7u64), Fp::from(42u64)], &params);
+        let h3 = poseidon2_hash([Fp::from(6u64), Fp::from(43u64)], &params);
         assert_ne!(h1, h2, "different first input should produce different hash");
         assert_ne!(h1, h3, "different second input should produce different hash");
     }

@@ -329,8 +329,11 @@ mod test {
 
     use super::{PathChip, PathConfig, SparsePathChip, SparsePathConfig};
     use crate::measure;
+    use crate::poseidon2_chip::{Poseidon2Chip, Poseidon2Config};
+    use crate::poseidon_chip::{PoseidonChip, PoseidonConfig};
     use crate::utilities::{AssertEqualChip, AssertEqualConfig};
     use ff::{Field, FromUniformBytes, PrimeField};
+    use halo2_proofs::circuit::AssignedCell;
     use halo2_proofs::dev::MockProver;
     use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, SingleVerifier};
     use halo2_proofs::poly::commitment::Params;
@@ -341,7 +344,7 @@ mod test {
     };
     use pasta_curves::{EqAffine, Fp};
     use rand::rngs::OsRng;
-    use smt::poseidon::FieldHasher;
+    use smt::poseidon::{FieldHasher, Poseidon, SmtP128Pow5T3};
     use smt::poseidon2::Poseidon2;
     use smt::smt::SparseMerkleTree;
     use std::clone::Clone;
@@ -1116,5 +1119,350 @@ mod test {
             verify_proof(&params_sparse, pk.get_vk(), strategy, &[&[]], &mut transcript);
         println!("Sparse verify_proof time: {:?}", now.elapsed());
         assert!(result.is_ok());
+    }
+
+    // ========== Poseidon1 vs Poseidon2 Benchmark Circuits ==========
+
+    // ---- Poseidon1 hash chain circuit (uses PoseidonChip / Pow5Chip) ----
+
+    #[derive(Clone)]
+    struct P1HashChainConfig<F: PrimeField> {
+        poseidon_config: PoseidonConfig<F, 3, 2>,
+        input: [Column<Advice>; 2],
+        output: Column<Advice>,
+    }
+
+    struct P1HashChainCircuit<F: PrimeField> {
+        pairs: Vec<[F; 2]>,
+        expected_final: F,
+    }
+
+    impl<F: PrimeField + FromUniformBytes<64> + Ord> Circuit<F> for P1HashChainCircuit<F> {
+        type Config = P1HashChainConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                pairs: vec![[F::ZERO; 2]; self.pairs.len()],
+                expected_final: F::ZERO,
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            let input = [meta.advice_column(), meta.advice_column()];
+            let output = meta.advice_column();
+            input.iter().for_each(|c| meta.enable_equality(*c));
+            meta.enable_equality(output);
+
+            P1HashChainConfig {
+                poseidon_config:
+                    PoseidonChip::<F, SmtP128Pow5T3<F, 0>, 3, 2, 2>::configure(meta),
+                input,
+                output,
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            let mut last_hash: Option<AssignedCell<F, F>> = None;
+            let num_hashes = self.pairs.len();
+
+            for i in 0..num_hashes {
+                let inputs = layouter.assign_region(
+                    || format!("p1_inputs_{}", i),
+                    |mut region| {
+                        let a = region.assign_advice(
+                            || "a",
+                            config.input[0],
+                            0,
+                            || Value::known(self.pairs[i][0]),
+                        )?;
+                        let b = region.assign_advice(
+                            || "b",
+                            config.input[1],
+                            0,
+                            || Value::known(self.pairs[i][1]),
+                        )?;
+                        Ok([a, b])
+                    },
+                )?;
+
+                let chip = PoseidonChip::<F, SmtP128Pow5T3<F, 0>, 3, 2, 2>::construct(
+                    config.poseidon_config.clone(),
+                );
+                last_hash = Some(chip.hash(
+                    &mut layouter.namespace(|| format!("p1_hash_{}", i)),
+                    &inputs,
+                )?);
+            }
+
+            layouter.assign_region(
+                || "p1_check_output",
+                |mut region| {
+                    let expected = region.assign_advice(
+                        || "expected",
+                        config.output,
+                        0,
+                        || Value::known(self.expected_final),
+                    )?;
+                    region.constrain_equal(
+                        last_hash.as_ref().unwrap().cell(),
+                        expected.cell(),
+                    )
+                },
+            )
+        }
+    }
+
+    // ---- Poseidon2 hash chain circuit (uses batched Poseidon2Chip) ----
+
+    #[derive(Clone)]
+    struct P2HashChainConfig<F: PrimeField> {
+        poseidon2_config: Poseidon2Config<F>,
+        input: [Column<Advice>; 2],
+        output: Column<Advice>,
+    }
+
+    struct P2HashChainCircuit<F: PrimeField> {
+        pairs: Vec<[F; 2]>,
+        expected_final: F,
+    }
+
+    impl<F: PrimeField + FromUniformBytes<64> + Ord> Circuit<F> for P2HashChainCircuit<F> {
+        type Config = P2HashChainConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                pairs: vec![[F::ZERO; 2]; self.pairs.len()],
+                expected_final: F::ZERO,
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            let input = [meta.advice_column(), meta.advice_column()];
+            let output = meta.advice_column();
+            input.iter().for_each(|c| meta.enable_equality(*c));
+            meta.enable_equality(output);
+
+            P2HashChainConfig {
+                poseidon2_config: Poseidon2Chip::<F, 2>::configure(meta),
+                input,
+                output,
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            let mut last_hash: Option<AssignedCell<F, F>> = None;
+            let num_hashes = self.pairs.len();
+
+            for i in 0..num_hashes {
+                let inputs = layouter.assign_region(
+                    || format!("p2_inputs_{}", i),
+                    |mut region| {
+                        let a = region.assign_advice(
+                            || "a",
+                            config.input[0],
+                            0,
+                            || Value::known(self.pairs[i][0]),
+                        )?;
+                        let b = region.assign_advice(
+                            || "b",
+                            config.input[1],
+                            0,
+                            || Value::known(self.pairs[i][1]),
+                        )?;
+                        Ok([a, b])
+                    },
+                )?;
+
+                let chip =
+                    Poseidon2Chip::<F, 2>::construct(config.poseidon2_config.clone());
+                last_hash = Some(chip.hash(
+                    &mut layouter.namespace(|| format!("p2_hash_{}", i)),
+                    &inputs,
+                )?);
+            }
+
+            layouter.assign_region(
+                || "p2_check_output",
+                |mut region| {
+                    let expected = region.assign_advice(
+                        || "expected",
+                        config.output,
+                        0,
+                        || Value::known(self.expected_final),
+                    )?;
+                    region.constrain_equal(
+                        last_hash.as_ref().unwrap().cell(),
+                        expected.cell(),
+                    )
+                },
+            )
+        }
+    }
+
+    // ---- Benchmark: Poseidon1 vs Poseidon2-batched ----
+
+    #[test]
+    #[ignore]
+    fn bench_poseidon1_vs_poseidon2() {
+        const HEIGHT: usize = 20;
+        let k = 13u32;
+        let rng = OsRng;
+
+        // Generate random pairs for the hash chain
+        let pairs: Vec<[Fp; 2]> = (0..HEIGHT)
+            .map(|_| [Fp::random(rng), Fp::random(rng)])
+            .collect();
+
+        // Compute expected final hash for each variant (last pair only)
+        let p1_hasher = Poseidon::<Fp, 2>::new();
+        let p1_expected = p1_hasher.hash(pairs[HEIGHT - 1]).unwrap();
+
+        let p2_hasher = Poseidon2::<Fp, 2>::new();
+        let p2_expected = p2_hasher.hash(pairs[HEIGHT - 1]).unwrap();
+
+        // ===== Part 1: Native Hash Throughput =====
+        let iterations = 10_000usize;
+        let bench_inputs: Vec<[Fp; 2]> = (0..iterations)
+            .map(|_| [Fp::random(rng), Fp::random(rng)])
+            .collect();
+
+        let start = Instant::now();
+        for inp in &bench_inputs {
+            let _ = p1_hasher.hash(*inp).unwrap();
+        }
+        let p1_native = start.elapsed();
+
+        let start = Instant::now();
+        for inp in &bench_inputs {
+            let _ = p2_hasher.hash(*inp).unwrap();
+        }
+        let p2_native = start.elapsed();
+
+        println!("\n========================================");
+        println!("  NATIVE HASH THROUGHPUT ({} iterations)", iterations);
+        println!("========================================");
+        println!(
+            "  Poseidon1: {:>8.1} ms  ({:.0} hashes/sec)",
+            p1_native.as_secs_f64() * 1000.0,
+            iterations as f64 / p1_native.as_secs_f64()
+        );
+        println!(
+            "  Poseidon2: {:>8.1} ms  ({:.0} hashes/sec)",
+            p2_native.as_secs_f64() * 1000.0,
+            iterations as f64 / p2_native.as_secs_f64()
+        );
+
+        // ===== Part 2a: Poseidon1 Circuit Proof =====
+        let p1_circuit = P1HashChainCircuit::<Fp> {
+            pairs: pairs.clone(),
+            expected_final: p1_expected,
+        };
+
+        println!("\n========================================");
+        println!(
+            "  POSEIDON1 CIRCUIT (k={}, {} hashes)",
+            k, HEIGHT
+        );
+        println!("========================================");
+
+        let start = Instant::now();
+        let prover = MockProver::run(k, &p1_circuit, vec![]).unwrap();
+        println!("  MockProver:   {:?}", start.elapsed());
+        assert_eq!(prover.verify(), Ok(()));
+
+        let params: Params<EqAffine> = Params::new(k);
+
+        let start = Instant::now();
+        let vk = keygen_vk(&params, &p1_circuit).unwrap();
+        let t_vk = start.elapsed();
+        let start = Instant::now();
+        let pk = keygen_pk(&params, vk, &p1_circuit).unwrap();
+        let t_pk = start.elapsed();
+        println!("  keygen_vk:    {:?}", t_vk);
+        println!("  keygen_pk:    {:?}", t_pk);
+
+        let start = Instant::now();
+        let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+        create_proof(
+            &params,
+            &pk,
+            &[p1_circuit],
+            &[&[]],
+            OsRng,
+            &mut transcript,
+        )
+        .unwrap();
+        let p1_proof = transcript.finalize();
+        println!("  create_proof: {:?}", start.elapsed());
+        println!("  proof size:   {} bytes", p1_proof.len());
+
+        let start = Instant::now();
+        let strategy = SingleVerifier::new(&params);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&p1_proof[..]);
+        verify_proof(&params, pk.get_vk(), strategy, &[&[]], &mut transcript).unwrap();
+        println!("  verify_proof: {:?}", start.elapsed());
+
+        // ===== Part 2b: Poseidon2-batched Circuit Proof =====
+        let p2_circuit = P2HashChainCircuit::<Fp> {
+            pairs: pairs.clone(),
+            expected_final: p2_expected,
+        };
+
+        println!("\n========================================");
+        println!(
+            "  POSEIDON2-BATCHED CIRCUIT (k={}, {} hashes)",
+            k, HEIGHT
+        );
+        println!("========================================");
+
+        let start = Instant::now();
+        let prover = MockProver::run(k, &p2_circuit, vec![]).unwrap();
+        println!("  MockProver:   {:?}", start.elapsed());
+        assert_eq!(prover.verify(), Ok(()));
+
+        // Reuse same k for apples-to-apples comparison on same evaluation domain
+        let params: Params<EqAffine> = Params::new(k);
+
+        let start = Instant::now();
+        let vk = keygen_vk(&params, &p2_circuit).unwrap();
+        let t_vk = start.elapsed();
+        let start = Instant::now();
+        let pk = keygen_pk(&params, vk, &p2_circuit).unwrap();
+        let t_pk = start.elapsed();
+        println!("  keygen_vk:    {:?}", t_vk);
+        println!("  keygen_pk:    {:?}", t_pk);
+
+        let start = Instant::now();
+        let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+        create_proof(
+            &params,
+            &pk,
+            &[p2_circuit],
+            &[&[]],
+            OsRng,
+            &mut transcript,
+        )
+        .unwrap();
+        let p2_proof = transcript.finalize();
+        println!("  create_proof: {:?}", start.elapsed());
+        println!("  proof size:   {} bytes", p2_proof.len());
+
+        let start = Instant::now();
+        let strategy = SingleVerifier::new(&params);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&p2_proof[..]);
+        verify_proof(&params, pk.get_vk(), strategy, &[&[]], &mut transcript).unwrap();
+        println!("  verify_proof: {:?}", start.elapsed());
+
+        println!("\n========================================\n");
     }
 }
