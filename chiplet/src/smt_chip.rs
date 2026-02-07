@@ -875,4 +875,408 @@ mod test {
         );
         assert_eq!(dense_root, smt.root(), "Root doesn't match SMT root");
     }
+
+    // ========== N=53 Realistic Benchmarks ==========
+
+    #[derive(Clone)]
+    struct DenseBenchConfig<
+        F: PrimeField,
+        S: Spec<F, WIDTH, RATE>,
+        H: FieldHasher<F, 2>,
+        const WIDTH: usize,
+        const RATE: usize,
+        const N: usize,
+    > {
+        path_config: PathConfig<F, S, WIDTH, RATE, N>,
+        advices: [Column<Advice>; 3],
+        assert_equal_config: AssertEqualConfig<F>,
+        _hasher: PhantomData<H>,
+    }
+
+    struct DenseBenchCircuit<
+        F: PrimeField,
+        S: Spec<F, WIDTH, RATE>,
+        H: FieldHasher<F, 2>,
+        const WIDTH: usize,
+        const RATE: usize,
+        const N: usize,
+    > {
+        root: F,
+        leaf: F,
+        path: smt::smt::Path<F, H, N>,
+        _spec: PhantomData<S>,
+    }
+
+    impl<
+            F: PrimeField + FromUniformBytes<64> + Ord,
+            S: Spec<F, WIDTH, RATE> + Clone,
+            H: FieldHasher<F, 2> + Clone,
+            const WIDTH: usize,
+            const RATE: usize,
+            const N: usize,
+        > Circuit<F> for DenseBenchCircuit<F, S, H, WIDTH, RATE, N>
+    {
+        type Config = DenseBenchConfig<F, S, H, WIDTH, RATE, N>;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                root: F::ZERO,
+                leaf: F::ZERO,
+                path: smt::smt::Path {
+                    path: [(F::ZERO, F::ZERO); N],
+                    direction_bits: [false; N],
+                    marker: PhantomData,
+                },
+                _spec: PhantomData,
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            let advices = [(); 3].map(|_| meta.advice_column());
+            advices
+                .iter()
+                .for_each(|column| meta.enable_equality(*column));
+
+            DenseBenchConfig {
+                path_config: PathChip::<F, S, H, WIDTH, RATE, N>::configure(meta),
+                advices,
+                assert_equal_config: AssertEqualChip::configure(meta, [advices[0], advices[1]]),
+                _hasher: PhantomData,
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            let (root_cell, leaf_cell, one) = layouter.assign_region(
+                || "bench circuit",
+                |mut region| {
+                    let root_cell = region.assign_advice(
+                        || "root",
+                        config.advices[0],
+                        0,
+                        || Value::known(self.root),
+                    )?;
+                    let leaf_cell = region.assign_advice(
+                        || "leaf",
+                        config.advices[1],
+                        0,
+                        || Value::known(self.leaf),
+                    )?;
+                    let one = region.assign_advice(
+                        || "one",
+                        config.advices[2],
+                        0,
+                        || Value::known(F::ONE),
+                    )?;
+                    Ok((root_cell, leaf_cell, one))
+                },
+            )?;
+
+            let path_chip = PathChip::<F, S, H, WIDTH, RATE, N>::from_native(
+                config.path_config,
+                &mut layouter,
+                self.path.clone(),
+            )?;
+            let res = path_chip.check_membership(&mut layouter, root_cell, leaf_cell)?;
+
+            let assert_equal_chip = AssertEqualChip::construct(config.assert_equal_config, ());
+            assert_equal_chip.assert_equal(&mut layouter, res, one)?;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SparseBenchConfig<
+        F: PrimeField,
+        S: Spec<F, WIDTH, RATE>,
+        H: FieldHasher<F, 2>,
+        const WIDTH: usize,
+        const RATE: usize,
+        const MAX_K: usize,
+    > {
+        sparse_path_config: SparsePathConfig<F, S, WIDTH, RATE, MAX_K>,
+        advices: [Column<Advice>; 3],
+        assert_equal_config: AssertEqualConfig<F>,
+        _hasher: PhantomData<H>,
+    }
+
+    struct SparseBenchCircuit<
+        F: PrimeField,
+        S: Spec<F, WIDTH, RATE>,
+        H: FieldHasher<F, 2>,
+        const WIDTH: usize,
+        const RATE: usize,
+        const MAX_K: usize,
+    > {
+        compact_root: F,
+        leaf: F,
+        sparse_path: smt::smt::SparsePath<F, H>,
+        _spec: PhantomData<S>,
+    }
+
+    impl<
+            F: PrimeField + FromUniformBytes<64> + Ord,
+            S: Spec<F, WIDTH, RATE> + Clone,
+            H: FieldHasher<F, 2> + Clone,
+            const WIDTH: usize,
+            const RATE: usize,
+            const MAX_K: usize,
+        > Circuit<F> for SparseBenchCircuit<F, S, H, WIDTH, RATE, MAX_K>
+    {
+        type Config = SparseBenchConfig<F, S, H, WIDTH, RATE, MAX_K>;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                compact_root: F::ZERO,
+                leaf: F::ZERO,
+                sparse_path: smt::smt::SparsePath {
+                    entries: Vec::new(),
+                    tree_height: 0,
+                    empty_hashes: Vec::new(),
+                    marker: PhantomData,
+                },
+                _spec: PhantomData,
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            let advices = [(); 3].map(|_| meta.advice_column());
+            advices
+                .iter()
+                .for_each(|column| meta.enable_equality(*column));
+
+            SparseBenchConfig {
+                sparse_path_config: SparsePathChip::<F, S, H, WIDTH, RATE, MAX_K>::configure(
+                    meta,
+                ),
+                advices,
+                assert_equal_config: AssertEqualChip::configure(meta, [advices[0], advices[1]]),
+                _hasher: PhantomData,
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            let (root_cell, leaf_cell, one) = layouter.assign_region(
+                || "bench circuit",
+                |mut region| {
+                    let root_cell = region.assign_advice(
+                        || "compact_root",
+                        config.advices[0],
+                        0,
+                        || Value::known(self.compact_root),
+                    )?;
+                    let leaf_cell = region.assign_advice(
+                        || "leaf",
+                        config.advices[1],
+                        0,
+                        || Value::known(self.leaf),
+                    )?;
+                    let one = region.assign_advice(
+                        || "one",
+                        config.advices[2],
+                        0,
+                        || Value::known(F::ONE),
+                    )?;
+                    Ok((root_cell, leaf_cell, one))
+                },
+            )?;
+
+            let sparse_path_chip = SparsePathChip::<F, S, H, WIDTH, RATE, MAX_K>::from_native(
+                config.sparse_path_config,
+                &mut layouter,
+                self.sparse_path.clone(),
+            )?;
+            let res =
+                sparse_path_chip.check_membership(&mut layouter, root_cell, leaf_cell)?;
+
+            let assert_equal_chip = AssertEqualChip::construct(config.assert_equal_config, ());
+            assert_equal_chip.assert_equal(&mut layouter, res, one)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bench_n53_dense_vs_sparse() {
+        use std::collections::BTreeMap;
+
+        let rng = OsRng;
+        let empty_leaf = [0u8; 64];
+        let hasher = Poseidon::<Fp, 2>::new();
+        const HEIGHT: usize = 53;
+        const MAX_K: usize = 32;
+
+        // Insert leaves at positions 0, 1, 2, 4, 8, ..., 2^26
+        // Each power-of-2 position forces a non-empty sibling at a different
+        // level, simulating the sparsity of ~100M items (2^27).
+        let mut leaf_map = BTreeMap::new();
+        let leaf0 = Fp::random(rng);
+        leaf_map.insert(0u32, leaf0);
+        for i in 0..27u32 {
+            leaf_map.insert(1u32 << i, Fp::random(rng));
+        }
+
+        println!("Building SMT with HEIGHT={}, {} leaves...", HEIGHT, leaf_map.len());
+        let now = Instant::now();
+        let smt = SparseMerkleTree::<Fp, Poseidon<Fp, 2>, HEIGHT>::new(
+            &leaf_map,
+            &hasher,
+            &empty_leaf,
+        )
+        .unwrap();
+        println!("SMT built in {:?}", now.elapsed());
+
+        let sparse_proof = smt.generate_sparse_membership_proof(0);
+        println!(
+            "Non-zero siblings: K = {} out of N = {} levels\n",
+            sparse_proof.entries.len(),
+            HEIGHT
+        );
+
+        let dense_path = smt.generate_membership_proof(0);
+        let dense_root = dense_path.calculate_root(&leaf0, &hasher).unwrap();
+        assert_eq!(dense_root, smt.root());
+
+        let compact_root = sparse_proof
+            .calculate_compact_root(&leaf0, &hasher)
+            .unwrap();
+        assert!(sparse_proof
+            .verify_against_root(&leaf0, &hasher, 0, &smt.root())
+            .unwrap());
+
+        // ===== Dense Benchmark =====
+        println!("===== Dense PathChip (N={}) =====", HEIGHT);
+
+        let dense_circuit = DenseBenchCircuit::<
+            Fp,
+            SmtP128Pow5T3<Fp, 0>,
+            Poseidon<Fp, 2>,
+            3,
+            2,
+            HEIGHT,
+        > {
+            root: dense_root,
+            leaf: leaf0,
+            path: dense_path,
+            _spec: PhantomData,
+        };
+
+        let k_dense = 12;
+        let now = Instant::now();
+        let prover = MockProver::run(k_dense, &dense_circuit, vec![]).unwrap();
+        println!("Dense MockProver (k={}) time: {:?}", k_dense, now.elapsed());
+        assert_eq!(prover.verify(), Ok(()));
+
+        let now = Instant::now();
+        let params_dense: Params<EqAffine> = Params::new(k_dense);
+        println!("Dense Params::new(k={}) time: {:?}", k_dense, now.elapsed());
+
+        let mut params_buf = vec![];
+        params_dense.write(&mut params_buf).unwrap();
+        println!("Dense Params size: {:.2} MB", params_buf.len() as f64 / (1024.0 * 1024.0));
+
+        let now = Instant::now();
+        let vk = keygen_vk(&params_dense, &dense_circuit).expect("keygen_vk should not fail");
+        println!("Dense keygen_vk time: {:?}", now.elapsed());
+
+        let now = Instant::now();
+        let pk = keygen_pk(&params_dense, vk, &dense_circuit).expect("keygen_pk should not fail");
+        println!("Dense keygen_pk time: {:?}", now.elapsed());
+
+        let now = Instant::now();
+        let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+        create_proof(&params_dense, &pk, &[dense_circuit], &[&[]], OsRng, &mut transcript)
+            .expect("proof generation should not fail");
+        let proof = transcript.finalize();
+        println!("Dense create_proof time: {:?}", now.elapsed());
+
+        let now = Instant::now();
+        let strategy = SingleVerifier::new(&params_dense);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+        let result = verify_proof(&params_dense, pk.get_vk(), strategy, &[&[]], &mut transcript);
+        println!("Dense verify_proof time: {:?}", now.elapsed());
+        assert!(result.is_ok());
+
+        // ===== Sparse Benchmark =====
+        println!("\n===== Sparse SparsePathChip (MAX_K={}) =====", MAX_K);
+
+        let sparse_circuit = SparseBenchCircuit::<
+            Fp,
+            SmtP128Pow5T3<Fp, 0>,
+            Poseidon<Fp, 2>,
+            3,
+            2,
+            MAX_K,
+        > {
+            compact_root,
+            leaf: leaf0,
+            sparse_path: sparse_proof,
+            _spec: PhantomData,
+        };
+
+        let k_sparse = 12;
+        let now = Instant::now();
+        let prover = MockProver::run(k_sparse, &sparse_circuit, vec![]).unwrap();
+        println!(
+            "Sparse MockProver (k={}) time: {:?}",
+            k_sparse,
+            now.elapsed()
+        );
+        assert_eq!(prover.verify(), Ok(()));
+
+        let now = Instant::now();
+        let params_sparse: Params<EqAffine> = Params::new(k_sparse);
+        println!(
+            "Sparse Params::new(k={}) time: {:?}",
+            k_sparse,
+            now.elapsed()
+        );
+
+        let mut params_buf = vec![];
+        params_sparse.write(&mut params_buf).unwrap();
+        println!(
+            "Sparse Params size: {:.2} MB",
+            params_buf.len() as f64 / (1024.0 * 1024.0)
+        );
+
+        let now = Instant::now();
+        let vk =
+            keygen_vk(&params_sparse, &sparse_circuit).expect("keygen_vk should not fail");
+        println!("Sparse keygen_vk time: {:?}", now.elapsed());
+
+        let now = Instant::now();
+        let pk =
+            keygen_pk(&params_sparse, vk, &sparse_circuit).expect("keygen_pk should not fail");
+        println!("Sparse keygen_pk time: {:?}", now.elapsed());
+
+        let now = Instant::now();
+        let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+        create_proof(
+            &params_sparse,
+            &pk,
+            &[sparse_circuit],
+            &[&[]],
+            OsRng,
+            &mut transcript,
+        )
+        .expect("proof generation should not fail");
+        let proof = transcript.finalize();
+        println!("Sparse create_proof time: {:?}", now.elapsed());
+
+        let now = Instant::now();
+        let strategy = SingleVerifier::new(&params_sparse);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+        let result =
+            verify_proof(&params_sparse, pk.get_vk(), strategy, &[&[]], &mut transcript);
+        println!("Sparse verify_proof time: {:?}", now.elapsed());
+        assert!(result.is_ok());
+    }
 }
