@@ -330,7 +330,6 @@ mod test {
     use super::{PathChip, PathConfig, SparsePathChip, SparsePathConfig};
     use crate::measure;
     use crate::poseidon2_chip::{Poseidon2Chip, Poseidon2Config};
-    use crate::poseidon_chip::{PoseidonChip, PoseidonConfig};
     use crate::utilities::{AssertEqualChip, AssertEqualConfig};
     use ff::{Field, FromUniformBytes, PrimeField};
     use halo2_proofs::circuit::AssignedCell;
@@ -344,7 +343,7 @@ mod test {
     };
     use pasta_curves::{EqAffine, Fp};
     use rand::rngs::OsRng;
-    use smt::poseidon::{FieldHasher, Poseidon, SmtP128Pow5T3};
+    use smt::poseidon::FieldHasher;
     use smt::poseidon2::Poseidon2;
     use smt::smt::SparseMerkleTree;
     use std::clone::Clone;
@@ -1123,11 +1122,11 @@ mod test {
 
     // ========== Poseidon1 vs Poseidon2 Benchmark Circuits ==========
 
-    // ---- Poseidon1 hash chain circuit (uses PoseidonChip / Pow5Chip) ----
+    // ---- Poseidon1 hash chain circuit (uses Poseidon2Chip) ----
 
     #[derive(Clone)]
     struct P1HashChainConfig<F: PrimeField> {
-        poseidon_config: PoseidonConfig<F, 3, 2>,
+        poseidon_config: Poseidon2Config<F>,
         input: [Column<Advice>; 2],
         output: Column<Advice>,
     }
@@ -1155,8 +1154,7 @@ mod test {
             meta.enable_equality(output);
 
             P1HashChainConfig {
-                poseidon_config:
-                    PoseidonChip::<F, SmtP128Pow5T3<F, 0>, 3, 2, 2>::configure(meta),
+                poseidon_config: Poseidon2Chip::<F, 2>::configure(meta),
                 input,
                 output,
             }
@@ -1190,9 +1188,8 @@ mod test {
                     },
                 )?;
 
-                let chip = PoseidonChip::<F, SmtP128Pow5T3<F, 0>, 3, 2, 2>::construct(
-                    config.poseidon_config.clone(),
-                );
+                let chip =
+                    Poseidon2Chip::<F, 2>::construct(config.poseidon_config.clone());
                 last_hash = Some(chip.hash(
                     &mut layouter.namespace(|| format!("p1_hash_{}", i)),
                     &inputs,
@@ -1324,7 +1321,7 @@ mod test {
             .collect();
 
         // Compute expected final hash for each variant (last pair only)
-        let p1_hasher = Poseidon::<Fp, 2>::new();
+        let p1_hasher = Poseidon2::<Fp, 2>::new();
         let p1_expected = p1_hasher.hash(pairs[HEIGHT - 1]).unwrap();
 
         let p2_hasher = Poseidon2::<Fp, 2>::new();
